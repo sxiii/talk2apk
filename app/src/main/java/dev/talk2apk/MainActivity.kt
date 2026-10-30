@@ -365,3 +365,157 @@ private object SecretStore {
     private var appContext: android.content.Context? = null
     fun initialize(context: android.content.Context) { appContext = context.applicationContext }
 }
+
+private class GitHubBuildClient(
+    private val token: String,
+    private val owner: String,
+    private val repo: String,
+    private val branch: String,
+    private val workflow: String,
+    private val cacheDir: File
+) {
+    private val api = "https://api.github.com"
+    private val userAgent = "Talk2APK-Phase1"
+
+    private fun request(
+        method: String,
+        path: String,
+        body: String? = null,
+        accept: String = "application/vnd.github+json"
+    ): HttpURLConnection {
+        val connection = (URL(api + path).openConnection() as HttpURLConnection).apply {
+            requestMethod = method
+            connectTimeout = 20_000
+            readTimeout = 60_000
+            setRequestProperty("Authorization", "Bearer $token")
+            setRequestProperty("Accept", accept)
+            setRequestProperty("X-GitHub-Api-Version", "2022-11-28")
+            setRequestProperty("User-Agent", userAgent)
+            if (body != null) {
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            }
+        }
+        val code = connection.responseCode
+        if (code !in 200..299) {
+            val stream = connection.errorStream
+            val message = stream?.bufferedReader()?.use { it.readText() } ?: "HTTP $code"
+            connection.disconnect()
+            throw IllegalStateException("GitHub API HTTP $code: ${message.take(500)}")
+        }
+        return connection
+    }
+
+    fun buildAndDownload(onStatus: (String) -> Unit): File {
+        require(owner.matches(Regex("[A-Za-z0-9-]+"))) { "Enter a valid GitHub owner." }
+        require(repo.matches(Regex("[A-Za-z0-9._-]+"))) { "Enter a valid repository name." }
+        require(branch.isNotBlank()) { "Branch cannot be empty." }
+        require(workflow.endsWith(".yml") || workflow.endsWith(".yaml") || workflow.matches(Regex("\\d+"))) {
+            "Workflow should be a .yml/.yaml filename or workflow ID."
+        }
+
+        onStatus("Checking repository and workflow…")
+        val encodedWorkflow = java.net.URLEncoder.encode(workflow, "UTF-8")
+        val encodedBranch = java.net.URLEncoder.encode(branch, "UTF-8")
+        val runStartedAt = Instant.now()
+
+        val dispatchBody = JSONObject().put("ref", branch).toString()
+        request(
+            "POST",
+            "/repos/$owner/$repo/actions/workflows/$encodedWorkflow/dispatches",
+            dispatchBody
+        ).disconnect()
+
+        onStatus("Workflow dispatched. Waiting for GitHub to create a run…")
+        var runId: Long? = null
+        var runStatus = ""
+        var runConclusion = ""
+        val deadline = System.currentTimeMillis() + 15 * 60 * 1000L
+
+        while (System.currentTimeMillis() < deadline) {
+            Thread.sleep(4000)
+            val runsConnection = request(
+                "GET",
+                "/repos/$owner/$repo/actions/runs?event=workflow_dispatch&branch=$encodedBranch&per_page=20"
+            )
+            val runsJson = runsConnection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+            runsConnection.disconnect()
+            val runs = runsJson.optJSONArray("workflow_runs")
+            if (runs != null) {
+                for (i in 0 until runs.length()) {
+                    val run = runs.getJSONObject(i)
+                    val runPath = run.optString("path")
+                    if (!runPath.contains(workflow) && !workflow.matches(Regex("\\d+"))) continue
+                    val created = run.optString("created_at")
+                    val createdInstant = try { Instant.parse(created) } catch (_: DateTimeParseException) { Instant.EPOCH }
+                    if (!createdInstant.isBefore(runStartedAt.minusSeconds(5))) {
+                        runId = run.optLong("id").takeIf { it > 0 }
+                        if (runId != null) {
+                            runStatus = run.optString("status")
+                            runConclusion = run.optString("conclusion")
+                            break
+                        }
+                    }
+                }
+            }
+
+            if (runId != null) {
+                if (runStatus == "completed") break
+                onStatus("Build running… status: $runStatus")
+            } else {
+                onStatus("Waiting for workflow run to appear…")
+            }
+        }
+
+        val finalRunId = runId ?: throw IllegalStateException("Timed out waiting for a workflow run. Check Actions are enabled and workflow_dispatch is present.")
+        if (runStatus != "completed") {
+            throw IllegalStateException("Build timed out. Open GitHub Actions to inspect run $finalRunId.")
+        }
+        if (runConclusion != "success") {
+            throw IllegalStateException("Workflow finished with '$runConclusion'. Open GitHub Actions to inspect run $finalRunId.")
+        }
+
+        onStatus("Build succeeded. Finding APK artifact…")
+        val artifactConnection = request("GET", "/repos/$owner/$repo/actions/runs/$finalRunId/artifacts?per_page=100")
+        val artifactJson = artifactConnection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+        artifactConnection.disconnect()
+        val artifacts = artifactJson.optJSONArray("artifacts")
+            ?: throw IllegalStateException("GitHub returned no artifacts.")
+        var artifactId: Long? = null
+        for (i in 0 until artifacts.length()) {
+            val artifact = artifacts.getJSONObject(i)
+            if (artifact.optString("name") == "talk2apk-debug-apk" && !artifact.optBoolean("expired")) {
+                artifactId = artifact.optLong("id").takeIf { it > 0 }
+                break
+            }
+        }
+        val id = artifactId ?: throw IllegalStateException("No unexpired 'talk2apk-debug-apk' artifact found for run $finalRunId.")
+
+        onStatus("Downloading APK artifact…")
+        val zipConnection = request("GET", "/repos/$owner/$repo/actions/artifacts/$id/zip", accept = "application/vnd.github+json")
+        val zipFile = File(cacheDir, "talk2apk-artifact-$id.zip")
+        zipConnection.inputStream.use { input -> FileOutputStream(zipFile).use { output -> input.copyTo(output) } }
+        zipConnection.disconnect()
+
+        val apk = File(cacheDir, "talk2apk-debug-$id.apk")
+        var extracted = false
+        ZipInputStream(BufferedInputStream(zipFile.inputStream())).use { zis ->
+            while (true) {
+                val entry = zis.nextEntry ?: break
+                if (!entry.isDirectory && entry.name.endsWith(".apk")) {
+                    FileOutputStream(apk).use { output -> zis.copyTo(output) }
+                    extracted = true
+                    break
+                }
+            }
+        }
+        zipFile.delete()
+        if (!extracted || !apk.exists() || apk.length() == 0L) {
+            apk.delete()
+            throw IllegalStateException("Artifact downloaded, but no APK was found inside it.")
+        }
+        return apk
+    }
+}
+
