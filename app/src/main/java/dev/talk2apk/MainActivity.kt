@@ -1,5 +1,6 @@
 package dev.talk2apk
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -10,153 +11,327 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.time.Instant
-import java.time.format.DateTimeParseException
-import java.util.zip.ZipInputStream
-import java.io.BufferedInputStream
-import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     private var pendingInstall: File? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         SecretStore.initialize(applicationContext)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
-                Talk2ApkApp(applicationContext.filesDir, cacheDir, ::installApk, ::requestInstallPermission)
+                Talk2ApkApp(this@MainActivity, cacheDir, ::installApk, ::requestInstallPermission)
             }
         }
     }
+
     override fun onResume() {
         super.onResume()
-        pendingInstall?.let { if (packageManager.canRequestPackageInstalls()) { pendingInstall = null; launchInstaller(it) } }
+        pendingInstall?.let {
+            if (packageManager.canRequestPackageInstalls()) {
+                pendingInstall = null
+                launchInstaller(it)
+            }
+        }
     }
+
     private fun installApk(file: File) {
         if (!file.exists() || file.length() == 0L) { toast("APK file is missing or empty"); return }
         if (!packageManager.canRequestPackageInstalls()) { pendingInstall = file; requestInstallPermission(); return }
         launchInstaller(file)
     }
+
     private fun requestInstallPermission() {
         try { startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).setData(Uri.parse("package:$packageName"))) }
         catch (_: Exception) { startActivity(Intent(Settings.ACTION_SECURITY_SETTINGS)) }
     }
+
     private fun launchInstaller(file: File) {
         try {
             val uri = FileProvider.getUriForFile(this, "$packageName.provider", file)
-            startActivity(Intent(Intent.ACTION_INSTALL_PACKAGE).setData(uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                .putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true).putExtra(Intent.EXTRA_RETURN_RESULT, true))
+            startActivity(Intent(Intent.ACTION_INSTALL_PACKAGE).setData(uri)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                .putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
+                .putExtra(Intent.EXTRA_RETURN_RESULT, true))
         } catch (e: Exception) { toast("Could not open package installer: ${e.message}") }
     }
+
     private fun toast(s: String) = android.widget.Toast.makeText(this, s, android.widget.Toast.LENGTH_LONG).show()
+}
+
+private object BuildStateStore {
+    private fun prefs(context: Context) = context.getSharedPreferences("talk2apk_builds", Context.MODE_PRIVATE)
+    fun save(context: Context, projectId: String, state: BuildSnapshot) {
+        val obj = JSONObject().put("runId", state.runId).put("status", state.status)
+            .put("conclusion", state.conclusion).put("htmlUrl", state.htmlUrl)
+            .put("artifactId", state.artifactId ?: JSONObject.NULL).put("message", state.message)
+            .put("errorDetails", state.errorDetails)
+        prefs(context).edit().putString(projectId, obj.toString()).apply()
+    }
+    fun load(context: Context, projectId: String): BuildSnapshot? {
+        return try {
+            val raw = prefs(context).getString(projectId, null) ?: return null
+            val o = JSONObject(raw)
+            BuildSnapshot(o.getLong("runId"), o.optString("status", "queued"), o.optString("conclusion"),
+                o.optString("htmlUrl"), o.optLong("artifactId").takeIf { !o.isNull("artifactId") && it > 0 },
+                o.optString("message"), o.optString("errorDetails"))
+        } catch (_: Exception) { null }
+    }
+    fun clear(context: Context, projectId: String) { prefs(context).edit().remove(projectId).apply() }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun Talk2ApkApp(filesDir: File, cacheDir: File, onInstall: (File) -> Unit, onRequestInstallPermission: () -> Unit) {
-    val prefs = androidx.compose.ui.platform.LocalContext.current.getSharedPreferences("talk2apk_settings", android.content.Context.MODE_PRIVATE)
-    var tab by remember { mutableIntStateOf(0) }
-    var projectName by remember { mutableStateOf("my-android-app") }
-    var apiBase by remember { mutableStateOf("https://api.openai.com/v1") }
-    var apiModel by remember { mutableStateOf("gpt-4.1-mini") }
-    var apiKey by remember { mutableStateOf("") }
-    var githubOwner by remember { mutableStateOf("") }
-    var githubRepo by remember { mutableStateOf("") }
-    var githubBranch by remember { mutableStateOf("main") }
-    var githubWorkflow by remember { mutableStateOf("android-build.yml") }
-    var githubToken by remember { mutableStateOf("") }
-    var settingsLoaded by remember { mutableStateOf(false) }
-    var customSystem by remember { mutableStateOf(AiFileProtocol.systemPrompt) }
-    var input by remember { mutableStateOf("") }
-    var messages by remember { mutableStateOf(listOf(ChatMessage("assistant", "Welcome to Talk2APK. Describe the Android app you want to create or change. I can generate project files, show a short change summary, and wait for your approval before publishing."))) }
-    var pending by remember { mutableStateOf<List<FileChange>>(emptyList()) }
-    var status by remember { mutableStateOf("Configure your AI provider and GitHub repository in Settings.") }
-    var busy by remember { mutableStateOf(false) }
-    var apkFile by remember { mutableStateOf<File?>(null) }
-    val scope = rememberCoroutineScope()
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val projectStore = remember(projectName) { ProjectStore(context, projectName) }
-
-    LaunchedEffect(projectStore.root.absolutePath) {
-        pending = projectStore.loadPending()
-        if (pending.isNotEmpty()) status = "Restored ${pending.size} pending file change(s). Review them in Changes before publishing."
-    }
-
-    LaunchedEffect(Unit) {
-        projectName = prefs.getString("project_name", "my-android-app") ?: "my-android-app"
-        apiBase = SecretStore.get("ai_api_base").ifBlank { apiBase }
-        apiModel = SecretStore.get("ai_model").ifBlank { apiModel }
-        apiKey = SecretStore.get("ai_api_key")
-        githubOwner = SecretStore.get("gh_owner")
-        githubRepo = SecretStore.get("gh_repo")
-        githubBranch = SecretStore.get("gh_branch").ifBlank { "main" }
-        githubWorkflow = SecretStore.get("gh_workflow").ifBlank { "android-build.yml" }
-        githubToken = SecretStore.get("gh_token")
-        customSystem = SecretStore.get("ai_system_prompt").ifBlank { AiFileProtocol.systemPrompt }
-        val saved = prefs.getString("chat_history", null)
-        if (!saved.isNullOrBlank()) try {
-            val arr = JSONArray(saved)
-            messages = (0 until arr.length()).map { i -> arr.getJSONObject(i).let { ChatMessage(it.getString("role"), it.getString("content")) } }
-        } catch (_: Exception) { }
-        settingsLoaded = true
-    }
-
-    fun persistSettings() {
-        SecretStore.put("ai_api_base", apiBase.trim().trimEnd('/'))
-        SecretStore.put("ai_model", apiModel.trim())
-        SecretStore.put("ai_api_key", apiKey.trim())
-        SecretStore.put("gh_owner", githubOwner.trim())
-        SecretStore.put("gh_repo", githubRepo.trim())
-        SecretStore.put("gh_branch", githubBranch.trim())
-        SecretStore.put("gh_workflow", githubWorkflow.trim())
-        SecretStore.put("gh_token", githubToken.trim())
-        SecretStore.put("ai_system_prompt", customSystem)
-        prefs.edit().putString("project_name", projectName).apply()
-    }
-    fun saveSettings() {
-        persistSettings()
-        status = "Settings saved securely on this device."
-    }
-    LaunchedEffect(settingsLoaded, projectName, apiBase, apiModel, apiKey, githubOwner, githubRepo, githubBranch, githubWorkflow, githubToken, customSystem) {
-        if (settingsLoaded) {
-            kotlinx.coroutines.delay(700)
-            persistSettings()
+private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> Unit, onRequestInstallPermission: () -> Unit) {
+    val prefs = remember { context.getSharedPreferences("talk2apk_settings", Context.MODE_PRIVATE) }
+    val profileStore = remember { ProjectProfiles(context) }
+    val initialProfiles = remember {
+        profileStore.load().ifEmpty {
+            // One-time migration from the single-project v0.3.x settings.
+            val legacyName = prefs.getString("project_name", "my-android-app") ?: "my-android-app"
+            val p = ProjectProfile(
+                name = legacyName,
+                owner = SecretStore.get("gh_owner"), repo = SecretStore.get("gh_repo"),
+                branch = SecretStore.get("gh_branch").ifBlank { "main" },
+                workflow = SecretStore.get("gh_workflow").ifBlank { "android-build.yml" }
+            )
+            profileStore.save(listOf(p), p.id)
+            prefs.getString("chat_history", null)?.let { prefs.edit().putString("chat_history_${p.id}", it).apply() }
+            p.let(::listOf)
         }
     }
-    fun saveHistory(list: List<ChatMessage>) {
-        val arr = JSONArray(); list.forEach { arr.put(JSONObject().put("role", it.role).put("content", it.content)) }
-        prefs.edit().putString("chat_history", arr.toString()).apply()
+    val initialActive = initialProfiles.firstOrNull { it.id == profileStore.activeId() } ?: initialProfiles.first()
+
+    var profiles by remember { mutableStateOf(initialProfiles) }
+    var project by remember { mutableStateOf(initialActive) }
+    var tab by remember { mutableIntStateOf(0) }
+    var projectMenu by remember { mutableStateOf(false) }
+    var showProjectManager by remember { mutableStateOf(false) }
+    var showCreateProject by remember { mutableStateOf(false) }
+    var newProjectName by remember { mutableStateOf("") }
+    var deleteTarget by remember { mutableStateOf<ProjectProfile?>(null) }
+
+    var globalAiBase by remember { mutableStateOf(SecretStore.get("global_ai_base").ifBlank { SecretStore.get("ai_api_base").ifBlank { "https://api.openai.com/v1" } }) }
+    var globalAiModel by remember { mutableStateOf(SecretStore.get("global_ai_model").ifBlank { SecretStore.get("ai_model").ifBlank { "gpt-4.1-mini" } }) }
+    var globalAiKey by remember { mutableStateOf(SecretStore.get("global_ai_key").ifBlank { SecretStore.get("ai_api_key") }) }
+
+    var localAiKey by remember(project.id) { mutableStateOf(SecretStore.get("project_${project.id}_local_ai_key")) }
+    var githubToken by remember(project.id) { mutableStateOf(SecretStore.get("project_${project.id}_github_token").ifBlank { if (project.id == initialActive.id) SecretStore.get("gh_token") else "" }) }
+    var systemPrompt by remember(project.id) {
+        mutableStateOf(SecretStore.get("project_${project.id}_system_prompt").ifBlank {
+            if (project.id == initialActive.id) SecretStore.get("ai_system_prompt").ifBlank { AiFileProtocol.systemPrompt } else AiFileProtocol.systemPrompt
+        })
     }
 
+    var input by remember { mutableStateOf("") }
+    var messages by remember { mutableStateOf(loadHistory(prefs, project.id)) }
+    var pending by remember { mutableStateOf<List<FileChange>>(emptyList()) }
+    var status by remember { mutableStateOf("Select a project, configure its GitHub repository, and start building.") }
+    var busy by remember { mutableStateOf(false) }
+    var apkFile by remember { mutableStateOf<File?>(null) }
+    var buildState by remember { mutableStateOf(BuildStateStore.load(context, project.id)) }
+    var buildErrorExpanded by remember { mutableStateOf(true) }
+    val scope = rememberCoroutineScope()
+    val monitoredBuilds = remember { mutableSetOf<String>() }
+    val projectStore = remember(project.id, project.name) { ProjectStore(context, project.name) }
+
+    fun saveHistoryFor(id: String, list: List<ChatMessage>) {
+        val arr = JSONArray()
+        list.forEach { arr.put(JSONObject().put("role", it.role).put("content", it.content)) }
+        prefs.edit().putString("chat_history_$id", arr.toString()).apply()
+    }
+
+    fun persistProject(p: ProjectProfile = project) {
+        val updated = profiles.map { if (it.id == p.id) p else it }
+        profiles = updated
+        profileStore.save(updated, p.id)
+        SecretStore.put("project_${p.id}_github_token", if (p.id == project.id) githubToken.trim() else SecretStore.get("project_${p.id}_github_token"))
+        if (p.id == project.id) {
+            SecretStore.put("project_${p.id}_local_ai_key", localAiKey.trim())
+            SecretStore.put("project_${p.id}_system_prompt", systemPrompt)
+        }
+        SecretStore.put("global_ai_base", globalAiBase.trim().trimEnd('/'))
+        SecretStore.put("global_ai_model", globalAiModel.trim())
+        SecretStore.put("global_ai_key", globalAiKey.trim())
+    }
+
+    fun activateProfile(next: ProjectProfile) {
+        persistProject()
+        project = next
+        profileStore.save(profiles, next.id)
+        messages = loadHistory(prefs, next.id)
+        pending = emptyList()
+        apkFile = null
+        buildState = BuildStateStore.load(context, next.id)
+        status = "Project switched to ${next.name}."
+        tab = 0
+    }
+
+    fun createProject(nameInput: String) {
+        val name = nameInput.trim()
+        require(name.isNotBlank()) { "Enter a project name" }
+        val safe = ProjectStore.safeProjectName(name)
+        require(profiles.none { ProjectStore.safeProjectName(it.name).equals(safe, true) }) { "A project with that name already exists" }
+        val p = ProjectProfile(name = name)
+        profiles = profiles + p
+        profileStore.save(profiles, p.id)
+        activateProfile(p)
+    }
+
+    fun cloneProject(source: ProjectProfile) {
+        val baseName = "${source.name}-copy"
+        var candidate = baseName
+        var suffix = 2
+        while (profiles.any { ProjectStore.safeProjectName(it.name).equals(ProjectStore.safeProjectName(candidate), true) }) {
+            candidate = "$baseName-$suffix"; suffix++
+        }
+        ProjectDirectories.clone(context, source.name, candidate)
+        val cloned = source.copy(id = UUID.randomUUID().toString(), name = candidate, owner = "", repo = "")
+        val clonedStore = ProjectStore(context, candidate)
+        val staged = clonedStore.loadPending()
+        if (staged.isNotEmpty()) { clonedStore.apply(staged); clonedStore.clearPending() }
+        profiles = profiles + cloned
+        profileStore.save(profiles, cloned.id)
+        SecretStore.put("project_${cloned.id}_local_ai_key", SecretStore.get("project_${source.id}_local_ai_key"))
+        SecretStore.put("project_${cloned.id}_system_prompt", SecretStore.get("project_${source.id}_system_prompt"))
+        SecretStore.put("project_${cloned.id}_github_token", "")
+        activateProfile(cloned)
+        status = "Cloned ${source.name}. Configure a new GitHub repository before publishing."
+    }
+
+    fun removeProject(target: ProjectProfile) {
+        if (profiles.size <= 1) { status = "Create another project before deleting the last one."; return }
+        ProjectDirectories.delete(context, target.name)
+        SecretStore.remove("project_${target.id}_github_token")
+        SecretStore.remove("project_${target.id}_local_ai_key")
+        SecretStore.remove("project_${target.id}_system_prompt")
+        BuildStateStore.clear(context, target.id)
+        prefs.edit().remove("chat_history_${target.id}").apply()
+        profiles = profiles.filterNot { it.id == target.id }
+        val next = if (project.id == target.id) profiles.first() else project
+        profileStore.save(profiles, next.id)
+        if (project.id == target.id) {
+            project = next
+            messages = loadHistory(prefs, next.id)
+            pending = emptyList()
+            apkFile = null
+            buildState = BuildStateStore.load(context, next.id)
+        }
+        status = "Deleted local project ${target.name}. Its GitHub repository was not deleted."
+    }
+
+    fun saveSettings() {
+        persistProject(project)
+        status = "Settings saved for ${project.name}. AI settings and credentials are stored on this device."
+    }
+
+    fun buildClient(p: ProjectProfile, token: String) = GitHubBuildClient(token, p.owner, p.repo, p.branch, p.workflow, cacheDir)
+
+    fun monitorBuild(p: ProjectProfile, token: String, runId: Long, htmlUrl: String) {
+        if (!monitoredBuilds.add(p.id)) return
+        scope.launch {
+            try {
+                var transientFailures = 0
+                while (true) {
+                try {
+                    val latest = withContext(Dispatchers.IO) { buildClient(p, token).getSnapshot(runId) }
+                    BuildStateStore.save(context, p.id, latest)
+                    if (project.id == p.id) {
+                        buildState = latest
+                        status = latest.message
+                    }
+                    transientFailures = 0
+                    if (latest.completed && (latest.conclusion != "success" || latest.artifactId != null)) break
+                } catch (e: Exception) {
+                    transientFailures++
+                    if (project.id == p.id) status = "Can't refresh GitHub status (${e.message}). Retrying automatically…"
+                    if (transientFailures >= 12) {
+                        val failed = BuildSnapshot(runId, "completed", "error", htmlUrl,
+                            message = "Stopped monitoring after repeated GitHub API errors.",
+                            errorDetails = "${e.message}\nCheck your token, network connection and GitHub Actions run.")
+                        BuildStateStore.save(context, p.id, failed)
+                        if (project.id == p.id) buildState = failed
+                        break
+                    }
+                }
+                    delay(5000)
+                }
+            } finally {
+                monitoredBuilds.remove(p.id)
+            }
+        }
+    }
+
+    LaunchedEffect(project.id, project.name) {
+        pending = projectStore.loadPending()
+        buildState = BuildStateStore.load(context, project.id)
+        if (pending.isNotEmpty()) status = "Restored ${pending.size} pending change(s) for ${project.name}."
+        val savedBuild = buildState
+        if (savedBuild != null && (!savedBuild.completed || (savedBuild.conclusion == "success" && savedBuild.artifactId == null)) && githubToken.isNotBlank()) {
+            monitorBuild(project, githubToken, savedBuild.runId, savedBuild.htmlUrl)
+        }
+    }
+
+    LaunchedEffect(project, githubToken, localAiKey, systemPrompt, globalAiBase, globalAiModel, globalAiKey) {
+        delay(600)
+        persistProject(project)
+    }
+
+    val effectiveAiBase = if (project.useLocalAi) project.localAiBase else globalAiBase
+    val effectiveAiModel = if (project.useLocalAi) project.localAiModel else globalAiModel
+    val effectiveAiKey = if (project.useLocalAi) localAiKey else globalAiKey
+
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Talk2APK") }, actions = { TextButton(onClick = { tab = 2 }) { Text("Settings") } }) },
-        bottomBar = { NavigationBar {
-            NavigationBarItem(selected = tab == 0, onClick = { tab = 0 }, icon = { Text("✦") }, label = { Text("Chat") })
-            NavigationBarItem(selected = tab == 1, onClick = { tab = 1 }, icon = { Text("✓") }, label = { Text("Changes") })
-            NavigationBarItem(selected = tab == 2, onClick = { tab = 2 }, icon = { Text("⚙") }, label = { Text("Settings") })
-        } }
+        topBar = {
+            TopAppBar(
+                title = {
+                    Box {
+                        TextButton(enabled = !busy, onClick = { projectMenu = true }) { Text("${project.name} ▾", maxLines = 1) }
+                        DropdownMenu(expanded = projectMenu, onDismissRequest = { projectMenu = false }) {
+                            profiles.forEach { p ->
+                                DropdownMenuItem(enabled = !busy, text = { Text(if (p.id == project.id) "✓ ${p.name}" else p.name) },
+                                    onClick = { projectMenu = false; if (!busy && p.id != project.id) activateProfile(p) })
+                            }
+                            Divider()
+                            DropdownMenuItem(enabled = !busy, text = { Text("Manage projects…") }, onClick = { projectMenu = false; if (!busy) showProjectManager = true })
+                        }
+                    }
+                },
+                actions = { TextButton(onClick = { tab = 2 }) { Text("Settings") } }
+            )
+        },
+        bottomBar = {
+            NavigationBar {
+                NavigationBarItem(selected = tab == 0, onClick = { tab = 0 }, icon = { Text("✦") }, label = { Text("Chat") })
+                NavigationBarItem(selected = tab == 1, onClick = { tab = 1 }, icon = { Text("✓") }, label = { Text("Changes / Build") })
+                NavigationBarItem(selected = tab == 2, onClick = { tab = 2 }, icon = { Text("⚙") }, label = { Text("Settings") })
+            }
+        }
     ) { padding ->
         when (tab) {
             0 -> Column(Modifier.fillMaxSize().padding(padding).padding(12.dp)) {
-                Text("Project: ${projectStore.root.name}", style = MaterialTheme.typography.titleMedium)
-                Text("Describe what you want to build or change. After sending, Talk2APK opens Changes so you can follow progress and review files.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("${project.name} · ${project.owner.ifBlank { "GitHub not configured" }}/${project.repo}",
+                    style = MaterialTheme.typography.titleSmall)
+                Text(if (project.useLocalAi) "AI engine: project-specific" else "AI engine: global default",
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(8.dp))
                 LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(messages) { msg ->
@@ -172,75 +347,104 @@ private fun Talk2ApkApp(filesDir: File, cacheDir: File, onInstall: (File) -> Uni
                 Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(value = input, onValueChange = { input = it }, modifier = Modifier.weight(1f),
                         placeholder = { Text("Describe a feature or change…") }, maxLines = 4, enabled = !busy && pending.isEmpty())
-                    Button(enabled = !busy && pending.isEmpty() && input.isNotBlank() && apiKey.isNotBlank(), onClick = {
+                    Button(enabled = !busy && pending.isEmpty() && input.isNotBlank() && effectiveAiKey.isNotBlank(), onClick = {
                         val prompt = input.trim(); input = ""
-                        val updated = messages + ChatMessage("user", prompt)
-                        messages = updated; saveHistory(updated)
-                        busy = true
-                        status = "Preparing project context…"
-                        tab = 1
+                        val history = messages + ChatMessage("user", prompt)
+                        messages = history; saveHistoryFor(project.id, history)
+                        busy = true; status = "Preparing project context…"; tab = 1
+                        val projectSnapshot = project
+                        val tokenSnapshot = githubToken
+                        val aiBaseSnapshot = effectiveAiBase
+                        val aiModelSnapshot = effectiveAiModel
+                        val aiKeySnapshot = effectiveAiKey
+                        val systemSnapshot = systemPrompt
                         scope.launch {
                             try {
-                                val projectContext = withContext(Dispatchers.IO) {
-                                    if (githubToken.isNotBlank() && githubOwner.isNotBlank() && githubRepo.isNotBlank()) {
-                                        GitHubPublisher(githubToken, githubOwner, githubRepo, githubBranch).syncProjectIfEmpty(projectStore)
+                                val contextAndWorkflow = withContext(Dispatchers.IO) {
+                                    if (tokenSnapshot.isNotBlank() && projectSnapshot.owner.isNotBlank() && projectSnapshot.repo.isNotBlank()) {
+                                        GitHubPublisher(tokenSnapshot, projectSnapshot.owner, projectSnapshot.repo, projectSnapshot.branch)
+                                            .syncProjectIfEmpty(projectStore)
                                     }
-                                    projectStore.contextForAi()
+                                    val configuredWorkflow = projectSnapshot.workflow
+                                    val workflowPath = if (configuredWorkflow.endsWith(".yml") || configuredWorkflow.endsWith(".yaml")) {
+                                        ".github/workflows/${configuredWorkflow.substringAfterLast('/')}"
+                                    } else DefaultBuildWorkflow.path
+                                    val workflowChange = if (projectStore.read(workflowPath).isBlank()) {
+                                        FileChange(workflowPath, "write", DefaultBuildWorkflow.content)
+                                    } else null
+                                    val baseContext = projectStore.contextForAi()
+                                    val fullContext = if (workflowChange != null) baseContext + "\n\nDEFAULT CI WORKFLOW TEMPLATE (will be included in the staged changes unless you return a replacement for this exact path):\n--- FILE: ${workflowChange.path} ---\n${workflowChange.content}"
+                                        else baseContext
+                                    fullContext to workflowChange
                                 }
-                                status = "Waiting for AI response… The model is analysing your request and generating code."
+                                val projectContext = contextAndWorkflow.first
+                                val defaultWorkflowChange = contextAndWorkflow.second
+                                status = "Waiting for AI response…"
                                 val reply = withContext(Dispatchers.IO) {
-                                    AiClient(apiBase, apiKey, apiModel).send(customSystem, updated, projectContext)
+                                    AiClient(aiBaseSnapshot, aiKeySnapshot, aiModelSnapshot).send(systemSnapshot, history, projectContext)
                                 }
-                                status = "Processing AI response…"
-                                val nextMessages = messages + ChatMessage("assistant", reply.text)
-                                messages = nextMessages
-                                saveHistory(nextMessages)
-                                if (reply.changes.isNotEmpty()) {
+                                messages = messages + ChatMessage("assistant", reply.text)
+                                saveHistoryFor(projectSnapshot.id, messages)
+                                val stagedChanges = reply.changes.toMutableList()
+                                if (defaultWorkflowChange != null && stagedChanges.none { it.path == defaultWorkflowChange.path }) {
+                                    stagedChanges.add(0, defaultWorkflowChange)
+                                }
+                                if (stagedChanges.isNotEmpty()) {
                                     status = "Validating generated files…"
-                                    reply.changes.forEach { change ->
+                                    stagedChanges.forEach { change ->
                                         projectStore.validatePath(change.path)
                                         require(change.action.lowercase() in setOf("write", "create", "update", "delete", "remove")) {
                                             "Unsupported operation for ${change.path}"
                                         }
                                     }
-                                    projectStore.savePending(reply.changes)
-                                    pending = reply.changes
-                                    status = "Changes ready for review. Check the file summary below, then publish when ready."
-                                } else {
-                                    status = "AI response received. No source-file changes were returned. You can continue chatting."
-                                }
+                                    projectStore.savePending(stagedChanges)
+                                    pending = stagedChanges
+                                    status = "${stagedChanges.size} file operation(s) ready for review."
+                                } else status = "AI response received. No source-file changes were returned."
                             } catch (e: Exception) {
-                                val errorMessages = messages + ChatMessage("assistant", "Request failed: ${e.message}")
-                                messages = errorMessages
-                                saveHistory(errorMessages)
+                                val failed = messages + ChatMessage("assistant", "Request failed: ${e.message}")
+                                messages = failed; saveHistoryFor(projectSnapshot.id, failed)
                                 status = "Request failed: ${e.message}"
                             } finally { busy = false }
                         }
                     }) { Text("Send") }
                 }
-                if (apiKey.isBlank()) Text("Add an AI API key in Settings.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                if (pending.isNotEmpty()) TextButton(onClick = { tab = 1 }) { Text("Review ${pending.size} pending file change(s)") }
+                if (effectiveAiKey.isBlank()) Text("Configure the selected AI engine in Settings.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                if (pending.isNotEmpty()) TextButton(onClick = { tab = 1 }) { Text("Review ${pending.size} pending operation(s)") }
             }
-            1 -> Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("Changes & publishing", style = MaterialTheme.typography.titleLarge)
-                Text("Repository: ${githubOwner.ifBlank { "—" }}/${githubRepo.ifBlank { "—" }} · branch $githubBranch", style = MaterialTheme.typography.bodyMedium)
+
+            1 -> Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("${project.name} · Changes & Build", style = MaterialTheme.typography.titleLarge)
+                Text("Repository: ${project.owner.ifBlank { "—" }}/${project.repo.ifBlank { "—" }} · ${project.branch}",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                            Text(if (busy) "IN PROGRESS" else if (pending.isNotEmpty()) "REVIEW REQUIRED" else "STATUS",
-                                style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                            if (busy || (buildState != null && (!buildState!!.completed || (buildState!!.conclusion == "success" && buildState!!.artifactId == null)))) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                            Text(when {
+                                busy -> "WORKING"
+                                buildState?.succeeded == true -> "BUILD SUCCESSFUL"
+                                buildState?.completed == true && buildState?.conclusion == "success" -> "BUILD OK · FINDING ARTIFACT"
+                                buildState?.completed == true -> "BUILD ERROR"
+                                buildState != null -> "BUILD IN PROGRESS"
+                                pending.isNotEmpty() -> "REVIEW REQUIRED"
+                                else -> "READY"
+                            }, style = MaterialTheme.typography.labelLarge, color = if (buildState?.completed == true && buildState?.conclusion != "success") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
                         }
-                        Text(status, style = MaterialTheme.typography.bodyMedium)
-                        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                        Text(if (buildState != null && buildState!!.runId > 0) buildState!!.message else status, style = MaterialTheme.typography.bodyMedium)
+                        if (busy || (buildState != null && (!buildState!!.completed || (buildState!!.conclusion == "success" && buildState!!.artifactId == null)))) LinearProgressIndicator(Modifier.fillMaxWidth())
+                        if (buildState?.htmlUrl?.isNotBlank() == true) TextButton(onClick = {
+                            try { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(buildState!!.htmlUrl))) } catch (_: Exception) { }
+                        }) { Text("Open GitHub Actions run") }
                     }
                 }
 
-                Text("Step 1 · Review generated changes", style = MaterialTheme.typography.titleMedium)
+                Text("Step 1 · Review changes", style = MaterialTheme.typography.titleMedium)
                 if (pending.isNotEmpty()) {
                     val summaries = projectStore.summaries(pending)
-                    Text("${pending.size} operation(s) · ${summaries.count { it.action.lowercase() !in setOf("delete", "remove") }} file(s) written · ${summaries.count { it.action.lowercase() in setOf("delete", "remove") }} deleted",
+                    Text("${pending.size} operation(s) · ${summaries.count { it.action.lowercase() !in setOf("delete", "remove") }} written · ${summaries.count { it.action.lowercase() in setOf("delete", "remove") }} deleted",
                         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Card(Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -248,7 +452,7 @@ private fun Talk2ApkApp(filesDir: File, cacheDir: File, onInstall: (File) -> Uni
                                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                                     Column(Modifier.weight(1f)) {
                                         Text(summary.path, style = MaterialTheme.typography.bodySmall)
-                                        Text(if (summary.action.lowercase() in setOf("delete", "remove")) "File will be deleted" else "${summary.added} lines added · ${summary.removed} removed",
+                                        Text(if (summary.action.lowercase() in setOf("delete", "remove")) "File will be deleted" else "+${summary.added} lines · −${summary.removed} lines",
                                             style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                     Text(if (summary.action.lowercase() in setOf("delete", "remove")) "DELETE" else "EDIT",
@@ -257,170 +461,213 @@ private fun Talk2ApkApp(filesDir: File, cacheDir: File, onInstall: (File) -> Uni
                             }
                         }
                     }
-                    Text("Review summary only: source files remain staged locally until publishing succeeds.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text("Step 2 · Publish approved changes", style = MaterialTheme.typography.titleMedium)
-                    Button(enabled = !busy && githubToken.isNotBlank() && githubOwner.isNotBlank() && githubRepo.isNotBlank(),
+                    Text("Files are staged locally. Publishing is a separate action.", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Button(enabled = !busy && githubToken.isNotBlank() && project.owner.isNotBlank() && project.repo.isNotBlank(),
                         onClick = {
-                            busy = true; status = "Publishing source changes to GitHub…"
+                            busy = true; status = "Publishing approved changes to GitHub…"
+                            val p = project; val changes = pending.toList(); val token = githubToken
                             scope.launch {
                                 try {
                                     val sha = withContext(Dispatchers.IO) {
-                                        GitHubPublisher(githubToken, githubOwner, githubRepo, githubBranch).publish(pending)
+                                        GitHubPublisher(token, p.owner, p.repo, p.branch).publish(changes)
                                     }
-                                    projectStore.apply(pending)
-                                    projectStore.clearPending()
-                                    pending = emptyList()
-                                    status = "Published commit ${sha.take(7)} to $githubOwner/$githubRepo ($githubBranch). You can now build the APK."
+                                    projectStore.apply(changes); projectStore.clearPending(); pending = emptyList()
+                                    status = "Published commit ${sha.take(7)}. You can now start the GitHub Actions build."
                                 } catch (e: Exception) { status = "Publish failed: ${e.message}" }
                                 finally { busy = false }
                             }
                         }, modifier = Modifier.fillMaxWidth()) { Text("Publish to GitHub") }
                     TextButton(enabled = !busy, onClick = {
-                        pending = emptyList(); projectStore.clearPending()
-                        status = "Pending changes discarded. Local project was not modified."
+                        pending = emptyList(); projectStore.clearPending(); status = "Pending changes discarded."
                     }, modifier = Modifier.fillMaxWidth()) { Text("Discard changes") }
                 } else {
-                    Text("No unpublished changes. Send a request in Chat to generate or modify project files.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("No unpublished changes. Generate changes in Chat or build the current GitHub branch.",
+                        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
 
                 Divider()
-                Text("Step 3 · Build APK", style = MaterialTheme.typography.titleMedium)
-                Text("GitHub Actions builds the project remotely. You can start a build after publishing any pending changes.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Button(enabled = !busy && pending.isEmpty() && githubToken.isNotBlank() && githubOwner.isNotBlank() && githubRepo.isNotBlank(),
+                Text("Step 2 · GitHub Actions build", style = MaterialTheme.typography.titleMedium)
+                Button(enabled = !busy && pending.isEmpty() && githubToken.isNotBlank() && project.owner.isNotBlank() && project.repo.isNotBlank() &&
+                    (buildState == null || buildState!!.completed && !(buildState!!.conclusion == "success" && buildState!!.artifactId == null)),
                     modifier = Modifier.fillMaxWidth(), onClick = {
-                        busy = true; apkFile = null; status = "Dispatching GitHub Actions workflow…"
+                        busy = true; apkFile = null; buildState = null; BuildStateStore.clear(context, project.id)
+                        status = "Dispatching GitHub Actions workflow…"
+                        val p = project; val token = githubToken
                         scope.launch {
                             try {
-                                val file = withContext(Dispatchers.IO) {
-                                    GitHubBuildClient(githubToken, githubOwner, githubRepo, githubBranch, githubWorkflow, cacheDir)
-                                        .buildAndDownload { stage -> scope.launch { status = stage } }
+                                val (runId, url) = withContext(Dispatchers.IO) {
+                                    buildClient(p, token).dispatchAndFindRun { stage ->
+                                        scope.launch { if (project.id == p.id) status = stage }
+                                    }
                                 }
-                                apkFile = file; status = "Build successful. APK downloaded: ${file.name}"
-                            } catch (e: Exception) { status = "Build failed: ${e.message}" }
-                            finally { busy = false }
+                                val initial = BuildSnapshot(runId, "queued", htmlUrl = url, message = "Build queued. Waiting for a GitHub runner…")
+                                BuildStateStore.save(context, p.id, initial)
+                                buildState = initial
+                                status = initial.message
+                                monitorBuild(p, token, runId, url)
+                            } catch (e: Exception) {
+                                status = "Could not start build: ${e.message}"
+                                buildState = BuildSnapshot(-1, "completed", "error", message = status, errorDetails = e.message.orEmpty())
+                            } finally { busy = false }
                         }
-                    }) { Text("Build APK") }
+                    }) { Text("Start GitHub Actions build") }
+
+                buildState?.let { state ->
+                    if (state.completed && state.conclusion != "success") {
+                        Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("Build failed: ${state.conclusion}", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onErrorContainer)
+                                if (state.errorDetails.isNotBlank()) {
+                                    TextButton(onClick = { buildErrorExpanded = !buildErrorExpanded }) {
+                                        Text(if (buildErrorExpanded) "Hide error details" else "Show error details")
+                                    }
+                                    if (buildErrorExpanded) SelectionContainer { Text(state.errorDetails, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer) }
+                                }
+                            }
+                        }
+                    }
+                    if (state.succeeded) {
+                        Text("Build completed successfully. GitHub's artifact is a ZIP archive containing the APK.",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Button(enabled = !busy, onClick = {
+                            val p = project; val token = githubToken; val artifactId = state.artifactId!!
+                            busy = true; status = "Downloading APK artifact ZIP from GitHub…"
+                            scope.launch {
+                                try {
+                                    val file = withContext(Dispatchers.IO) { buildClient(p, token).downloadApk(artifactId) }
+                                    apkFile = file; status = "APK downloaded: ${file.name}"
+                                } catch (e: Exception) { status = "APK download failed: ${e.message}" }
+                                finally { busy = false }
+                            }
+                        }, modifier = Modifier.fillMaxWidth()) { Text("Download APK") }
+                    }
+                }
                 apkFile?.let { file ->
+                    Text("Downloaded: ${file.name}", style = MaterialTheme.typography.bodySmall)
                     Button(onClick = { onInstall(file) }, modifier = Modifier.fillMaxWidth()) { Text("Install APK") }
                     TextButton(onClick = onRequestInstallPermission, modifier = Modifier.fillMaxWidth()) { Text("Manage install permission") }
                 }
-                if (githubToken.isBlank() || githubOwner.isBlank() || githubRepo.isBlank()) {
-                    Text("Configure your GitHub owner, repository and token in Settings before publishing or building.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                if (githubToken.isBlank() || project.owner.isBlank() || project.repo.isBlank()) {
+                    Text("Configure this project's GitHub owner, repository and token in Settings.", color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall)
                 }
             }
-            else -> Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("Project", style = MaterialTheme.typography.titleLarge)
-                OutlinedTextField(projectName, { projectName = it }, label = { Text("Project name") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+
+            else -> Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Project settings · ${project.name}", style = MaterialTheme.typography.titleLarge)
+                Text("These GitHub settings belong only to this project.", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Divider()
-                Text("AI provider", style = MaterialTheme.typography.titleLarge)
-                OutlinedTextField(apiBase, { apiBase = it }, label = { Text("API base URL (HTTPS)") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                OutlinedTextField(apiModel, { apiModel = it }, label = { Text("Model ID") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                OutlinedTextField(apiKey, { apiKey = it }, label = { Text("AI API key") }, modifier = Modifier.fillMaxWidth(), singleLine = true, visualTransformation = PasswordVisualTransformation())
-                OutlinedTextField(customSystem, { customSystem = it }, label = { Text("System instructions") }, modifier = Modifier.fillMaxWidth(), minLines = 4)
+                Text("AI engine", style = MaterialTheme.typography.titleLarge)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Use a project-specific AI engine", style = MaterialTheme.typography.bodyMedium)
+                        Text(if (project.useLocalAi) "This project uses its own endpoint, model and key." else "This project uses the global AI settings below.",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(checked = project.useLocalAi, onCheckedChange = { project = project.copy(useLocalAi = it) })
+                }
+                if (project.useLocalAi) {
+                    OutlinedTextField(project.localAiBase, { project = project.copy(localAiBase = it) }, label = { Text("Project AI API base URL") },
+                        modifier = Modifier.fillMaxWidth(), singleLine = true)
+                    OutlinedTextField(project.localAiModel, { project = project.copy(localAiModel = it) }, label = { Text("Project AI model") },
+                        modifier = Modifier.fillMaxWidth(), singleLine = true)
+                    OutlinedTextField(localAiKey, { localAiKey = it }, label = { Text("Project AI API key") },
+                        modifier = Modifier.fillMaxWidth(), singleLine = true, visualTransformation = PasswordVisualTransformation())
+                }
+                Text("Global AI defaults", style = MaterialTheme.typography.titleMedium)
+                OutlinedTextField(globalAiBase, { globalAiBase = it }, label = { Text("Global API base URL (HTTPS)") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(globalAiModel, { globalAiModel = it }, label = { Text("Global model ID") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(globalAiKey, { globalAiKey = it }, label = { Text("Global AI API key") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true, visualTransformation = PasswordVisualTransformation())
+                OutlinedTextField(systemPrompt, { systemPrompt = it }, label = { Text("System instructions for this project") },
+                    modifier = Modifier.fillMaxWidth(), minLines = 4)
+
                 Divider()
-                Text("GitHub", style = MaterialTheme.typography.titleLarge)
-                OutlinedTextField(githubOwner, { githubOwner = it.trim() }, label = { Text("Owner / organization") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                OutlinedTextField(githubRepo, { githubRepo = it.trim() }, label = { Text("Repository") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                OutlinedTextField(githubBranch, { githubBranch = it }, label = { Text("Branch") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                OutlinedTextField(githubWorkflow, { githubWorkflow = it }, label = { Text("Workflow filename or ID") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                OutlinedTextField(githubToken, { githubToken = it }, label = { Text("Fine-grained GitHub token") }, modifier = Modifier.fillMaxWidth(), singleLine = true, visualTransformation = PasswordVisualTransformation())
-                Text("Recommended token permissions for this repository: Contents read/write and Actions read/write. Metadata read is automatic. Tokens are encrypted on this device.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Button(onClick = { saveSettings() }, modifier = Modifier.fillMaxWidth()) { Text("Save all settings") }
+                Text("GitHub repository", style = MaterialTheme.typography.titleLarge)
+                OutlinedTextField(project.owner, { project = project.copy(owner = it.trim()) }, label = { Text("Owner / organization") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(project.repo, { project = project.copy(repo = it.trim()) }, label = { Text("Repository name") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(project.branch, { project = project.copy(branch = it) }, label = { Text("Branch") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(project.workflow, { project = project.copy(workflow = it) }, label = { Text("Workflow filename or ID") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(githubToken, { githubToken = it }, label = { Text("Fine-grained GitHub token") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true, visualTransformation = PasswordVisualTransformation())
+                Text("Recommended token permissions: Contents read/write and Actions read/write. Metadata read is automatic. Each project's token is encrypted separately on this device.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Button(onClick = { saveSettings() }, modifier = Modifier.fillMaxWidth()) { Text("Save project and AI settings") }
                 Text(status, style = MaterialTheme.typography.bodySmall)
-                Text("AI endpoints must support OpenAI-compatible Chat Completions and function calling, or return the documented JSON file format. Consumer AI subscriptions do not automatically include API access.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("AI endpoints must support OpenAI-compatible Chat Completions and function calling, or the Talk2APK JSON file protocol. Consumer AI subscriptions do not automatically include API access.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
+
+    if (showProjectManager) {
+        AlertDialog(
+            onDismissRequest = { showProjectManager = false },
+            title = { Text("Manage projects") },
+            text = {
+                Column(Modifier.heightIn(max = 480.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { newProjectName = ""; showCreateProject = true }, modifier = Modifier.fillMaxWidth()) { Text("Create new project") }
+                    LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(profiles, key = { it.id }) { p ->
+                            Card(Modifier.fillMaxWidth()) {
+                                Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text(if (p.id == project.id) "${p.name} · ACTIVE" else p.name, style = MaterialTheme.typography.titleSmall)
+                                    Text("${p.owner.ifBlank { "No owner" }}/${p.repo.ifBlank { "No repository" }} · ${p.branch}",
+                                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        TextButton(onClick = { if (p.id != project.id) activateProfile(p); showProjectManager = false; tab = 2 }) { Text("Edit") }
+                                        TextButton(onClick = { try { cloneProject(p); showProjectManager = false } catch (e: Exception) { status = "Clone failed: ${e.message}" } }) { Text("Clone") }
+                                        TextButton(enabled = profiles.size > 1, onClick = { deleteTarget = p }) { Text("Delete") }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showProjectManager = false }) { Text("Close") } }
+        )
+    }
+
+    if (showCreateProject) {
+        AlertDialog(
+            onDismissRequest = { showCreateProject = false },
+            title = { Text("Create project") },
+            text = { OutlinedTextField(newProjectName, { newProjectName = it }, label = { Text("Project name") }, singleLine = true) },
+            confirmButton = { TextButton(onClick = {
+                try { createProject(newProjectName); showCreateProject = false; showProjectManager = false }
+                catch (e: Exception) { status = "Could not create project: ${e.message}" }
+            }) { Text("Create") } },
+            dismissButton = { TextButton(onClick = { showCreateProject = false }) { Text("Cancel") } }
+        )
+    }
+
+    deleteTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { deleteTarget = null },
+            title = { Text("Delete ${target.name}?") },
+            text = { Text("This permanently deletes this project's local source files, chat history and saved credentials from this device. The GitHub repository itself will NOT be deleted. This cannot be undone.") },
+            confirmButton = { TextButton(onClick = { removeProject(target); deleteTarget = null }) { Text("Delete project") } },
+            dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("Cancel") } }
+        )
+    }
 }
 
-/** AES/GCM encryption backed by a non-exportable Android Keystore key. */
-private object SecretStore {
-    private const val PREFS = "talk2apk_secure"
-    private const val KEY_ALIAS = "talk2apk_aes_key"
-    private var appContext: android.content.Context? = null
-    fun initialize(context: android.content.Context) { appContext = context.applicationContext }
-    private fun key(): java.security.Key {
-        val ks = java.security.KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        (ks.getKey(KEY_ALIAS, null) as? java.security.Key)?.let { return it }
-        val gen = javax.crypto.KeyGenerator.getInstance(android.security.keystore.KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
-        val spec = android.security.keystore.KeyGenParameterSpec.Builder(KEY_ALIAS,
-            android.security.keystore.KeyProperties.PURPOSE_ENCRYPT or android.security.keystore.KeyProperties.PURPOSE_DECRYPT)
-            .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
-            .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE)
-            .setRandomizedEncryptionRequired(true).build()
-        gen.init(spec); return gen.generateKey()
-    }
-    fun put(name: String, value: String) {
-        val prefs = appContext?.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE) ?: return
-        if (value.isEmpty()) { prefs.edit().remove(name).apply(); return }
-        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding"); cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, key())
-        val payload = cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8))
-        prefs.edit().putString(name, android.util.Base64.encodeToString(payload, android.util.Base64.NO_WRAP)).apply()
-    }
-    fun get(name: String): String {
-        val encoded = appContext?.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)?.getString(name, null) ?: return ""
-        return try {
-            val payload = android.util.Base64.decode(encoded, android.util.Base64.NO_WRAP)
-            val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(javax.crypto.Cipher.DECRYPT_MODE, key(), javax.crypto.spec.GCMParameterSpec(128, payload.copyOfRange(0, 12)))
-            String(cipher.doFinal(payload.copyOfRange(12, payload.size)), Charsets.UTF_8)
-        } catch (_: Exception) { "" }
-    }
-}
-
-private class GitHubBuildClient(private val token: String, private val owner: String, private val repo: String,
-    private val branch: String, private val workflow: String, private val cacheDir: File) {
-    private val api = "https://api.github.com"
-    private fun request(method: String, path: String, body: String? = null, accept: String = "application/vnd.github+json"): HttpURLConnection {
-        val c = (URL(api + path).openConnection() as HttpURLConnection).apply {
-            requestMethod = method; connectTimeout = 20_000; readTimeout = 60_000
-            setRequestProperty("Authorization", "Bearer $token"); setRequestProperty("Accept", accept)
-            setRequestProperty("X-GitHub-Api-Version", "2022-11-28"); setRequestProperty("User-Agent", "Talk2APK")
-            if (body != null) { doOutput = true; setRequestProperty("Content-Type", "application/json"); outputStream.use { it.write(body.toByteArray()) } }
-        }
-        val code = c.responseCode
-        if (code !in 200..299) { val msg = c.errorStream?.bufferedReader()?.use { it.readText() } ?: "HTTP $code"; c.disconnect(); throw IllegalStateException("GitHub API HTTP $code: ${msg.take(500)}") }
-        return c
-    }
-    fun buildAndDownload(onStatus: (String) -> Unit): File {
-        require(owner.matches(Regex("[A-Za-z0-9-]+")) && repo.matches(Regex("[A-Za-z0-9._-]+"))) { "Enter valid GitHub owner and repository" }
-        require(branch.isNotBlank()) { "Branch cannot be empty" }
-        require(workflow.endsWith(".yml") || workflow.endsWith(".yaml") || workflow.matches(Regex("\\d+"))) { "Workflow must be a .yml/.yaml filename or ID" }
-        onStatus("Dispatching workflow…")
-        val wf = java.net.URLEncoder.encode(workflow, "UTF-8"); val br = java.net.URLEncoder.encode(branch, "UTF-8")
-        val started = Instant.now()
-        request("POST", "/repos/$owner/$repo/actions/workflows/$wf/dispatches", JSONObject().put("ref", branch).toString()).disconnect()
-        onStatus("Waiting for GitHub Actions…")
-        var runId: Long? = null; var runStatus = ""; var conclusion = ""
-        val deadline = System.currentTimeMillis() + 15 * 60_000L
-        while (System.currentTimeMillis() < deadline) {
-            Thread.sleep(4000)
-            val c = request("GET", "/repos/$owner/$repo/actions/runs?event=workflow_dispatch&branch=$br&per_page=20")
-            val data = c.inputStream.bufferedReader().use { JSONObject(it.readText()) }; c.disconnect()
-            val runs = data.optJSONArray("workflow_runs")
-            if (runs != null) for (i in 0 until runs.length()) {
-                val r = runs.getJSONObject(i)
-                if (!r.optString("path").contains(workflow) && !workflow.matches(Regex("\\d+"))) continue
-                val created = try { Instant.parse(r.optString("created_at")) } catch (_: DateTimeParseException) { Instant.EPOCH }
-                if (!created.isBefore(started.minusSeconds(5))) { runId = r.optLong("id").takeIf { it > 0 }; runStatus = r.optString("status"); conclusion = r.optString("conclusion"); break }
-            }
-            if (runId != null && runStatus == "completed") break
-            onStatus(if (runId == null) "Waiting for workflow run…" else "Build status: $runStatus")
-        }
-        val id = runId ?: throw IllegalStateException("Timed out waiting for workflow run. Check workflow_dispatch and token Actions permission.")
-        if (runStatus != "completed") throw IllegalStateException("Build timed out. Check GitHub Actions run $id")
-        if (conclusion != "success") throw IllegalStateException("Build ended with '$conclusion'. Check GitHub Actions run $id")
-        onStatus("Build succeeded. Downloading APK artifact…")
-        val ac = request("GET", "/repos/$owner/$repo/actions/runs/$id/artifacts?per_page=100")
-        val arr = ac.inputStream.bufferedReader().use { JSONObject(it.readText()).optJSONArray("artifacts") ?: JSONArray() }; ac.disconnect()
-        var artifactId: Long? = null
-        for (i in 0 until arr.length()) { val a = arr.getJSONObject(i); if (a.optString("name") == "talk2apk-debug-apk" && !a.optBoolean("expired")) { artifactId = a.optLong("id"); break } }
-        val aid = artifactId ?: throw IllegalStateException("No unexpired talk2apk-debug-apk artifact found")
-        val z = request("GET", "/repos/$owner/$repo/actions/artifacts/$aid/zip")
-        val zip = File(cacheDir, "talk2apk-$aid.zip"); z.inputStream.use { input -> FileOutputStream(zip).use { input.copyTo(it) } }; z.disconnect()
-        val apk = File(cacheDir, "talk2apk-$aid.apk"); var found = false
-        ZipInputStream(BufferedInputStream(zip.inputStream())).use { zis -> while (true) { val e = zis.nextEntry ?: break; if (!e.isDirectory && e.name.endsWith(".apk")) { FileOutputStream(apk).use { zis.copyTo(it) }; found = true; break } } }
-        zip.delete(); if (!found || !apk.exists() || apk.length() == 0L) throw IllegalStateException("Downloaded artifact did not contain an APK")
-        return apk
-    }
+private fun loadHistory(prefs: android.content.SharedPreferences, projectId: String): List<ChatMessage> {
+    val raw = prefs.getString("chat_history_$projectId", null)
+    if (raw.isNullOrBlank()) return listOf(ChatMessage("assistant", "Welcome to Talk2APK. Describe the Android app you want to create or change."))
+    return try {
+        val arr = JSONArray(raw)
+        (0 until arr.length()).map { i -> arr.getJSONObject(i).let { ChatMessage(it.getString("role"), it.getString("content")) } }
+    } catch (_: Exception) { emptyList() }
 }

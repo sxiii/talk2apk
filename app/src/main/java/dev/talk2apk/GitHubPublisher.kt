@@ -31,7 +31,15 @@ class GitHubPublisher(private val token: String, private val owner: String, priv
     fun syncProjectIfEmpty(store: ProjectStore): Int {
         if (store.listFiles().isNotEmpty()) return 0
         val encBranch = URLEncoder.encode(branch, "UTF-8").replace("+", "%20")
-        val ref = call("GET", "/repos/$owner/$repo/git/ref/heads/$encBranch")
+        val ref = try {
+            call("GET", "/repos/$owner/$repo/git/ref/heads/$encBranch")
+        } catch (e: Exception) {
+            if (!e.message.orEmpty().contains("HTTP 404")) throw e
+            val repository = call("GET", "/repos/$owner/$repo")
+            val defaultBranch = repository.optString("default_branch")
+            if (defaultBranch.isBlank()) return 0 // Newly-created, empty repository has no Git ref yet.
+            call("GET", "/repos/$owner/$repo/git/ref/heads/${URLEncoder.encode(defaultBranch, "UTF-8").replace("+", "%20")}")
+        }
         val commitSha = ref.getJSONObject("object").getString("sha")
         val commit = call("GET", "/repos/$owner/$repo/git/commits/$commitSha")
         val treeSha = commit.getJSONObject("tree").getString("sha")
@@ -69,10 +77,29 @@ class GitHubPublisher(private val token: String, private val owner: String, priv
         require(changes.isNotEmpty()) { "There are no changes to publish" }
         require(changes.map { it.path }.distinct().size == changes.size) { "AI returned duplicate paths; ask it to consolidate the file operations" }
         val encBranch = URLEncoder.encode(branch, "UTF-8").replace("+", "%20")
-        val ref = call("GET", "/repos/$owner/$repo/git/ref/heads/$encBranch")
-        val parentSha = ref.getJSONObject("object").getString("sha")
-        val parent = call("GET", "/repos/$owner/$repo/git/commits/$parentSha")
-        val baseTree = parent.getJSONObject("tree").getString("sha")
+        var parentSha: String? = null
+        var baseTree: String? = null
+        var branchAlreadyExists = true
+        val ref = try {
+            call("GET", "/repos/$owner/$repo/git/ref/heads/$encBranch")
+        } catch (e: Exception) {
+            if (!e.message.orEmpty().contains("HTTP 404")) throw e
+            branchAlreadyExists = false
+            val repository = call("GET", "/repos/$owner/$repo")
+            val defaultBranch = repository.optString("default_branch")
+            if (defaultBranch.isNotBlank()) {
+                val defaultRef = call("GET", "/repos/$owner/$repo/git/ref/heads/${URLEncoder.encode(defaultBranch, "UTF-8").replace("+", "%20")}")
+                parentSha = defaultRef.getJSONObject("object").getString("sha")
+                val parent = call("GET", "/repos/$owner/$repo/git/commits/$parentSha")
+                baseTree = parent.getJSONObject("tree").getString("sha")
+            }
+            JSONObject()
+        }
+        if (branchAlreadyExists) {
+            parentSha = ref.getJSONObject("object").getString("sha")
+            val parent = call("GET", "/repos/$owner/$repo/git/commits/$parentSha")
+            baseTree = parent.getJSONObject("tree").getString("sha")
+        }
         val tree = JSONArray()
         changes.forEach { change ->
             val path = change.path
@@ -87,11 +114,19 @@ class GitHubPublisher(private val token: String, private val owner: String, priv
                 tree.put(JSONObject().put("path", path).put("mode", "100644").put("type", "blob").put("sha", blob.getString("sha")))
             }
         }
-        val newTree = call("POST", "/repos/$owner/$repo/git/trees", JSONObject().put("base_tree", baseTree).put("tree", tree))
+        val treeBody = JSONObject().put("tree", tree)
+        if (baseTree != null) treeBody.put("base_tree", baseTree)
+        val newTree = call("POST", "/repos/$owner/$repo/git/trees", treeBody)
+        val parents = JSONArray()
+        parentSha?.let { parents.put(it) }
         val commit = call("POST", "/repos/$owner/$repo/git/commits", JSONObject()
-            .put("message", commitMessage).put("tree", newTree.getString("sha")).put("parents", JSONArray().put(parentSha)))
+            .put("message", commitMessage).put("tree", newTree.getString("sha")).put("parents", parents))
         val commitSha = commit.getString("sha")
-        call("PATCH", "/repos/$owner/$repo/git/refs/heads/$encBranch", JSONObject().put("sha", commitSha).put("force", false))
+        if (branchAlreadyExists) {
+            call("PATCH", "/repos/$owner/$repo/git/refs/heads/$encBranch", JSONObject().put("sha", commitSha).put("force", false))
+        } else {
+            call("POST", "/repos/$owner/$repo/git/refs", JSONObject().put("ref", "refs/heads/$branch").put("sha", commitSha))
+        }
         return commitSha
     }
 }

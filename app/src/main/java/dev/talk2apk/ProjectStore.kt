@@ -105,13 +105,9 @@ class ProjectStore(context: Context, projectName: String) {
 }
 
 object AiFileProtocol {
-    val systemPrompt = """You are Talk2APK, an autonomous Android application coding assistant.
-You help build and maintain a complete Android project. You may discuss plans normally, but whenever you make source changes you MUST call the apply_file_changes tool if available. If tools are unavailable, return one valid JSON object and nothing else.
-The schema is {"operation":"apply_changes","files":[{"path":"relative/path","action":"write|delete","content":"full UTF-8 file content for write; omit for delete"}]}.
-Paths must be relative to the project root. Include complete file contents, not patches or snippets. Do not include ZIPs or binary files. Do not change GitHub credentials or app secrets. Do not modify .github/workflows unless the user explicitly requests build workflow changes. Preserve unrelated files. For changes to existing files, use the current project contents provided in context. Never claim changes were applied unless you return file operations.
+    val systemPrompt = """You are Talk2APK, an expert Android app coding agent. Use the supplied project tree and file contents; preserve unrelated code and make the smallest complete change. When changing files, call apply_file_changes if available; otherwise return exactly one valid JSON object: {"operation":"apply_changes","files":[{"path":"relative/path","action":"write|delete","content":"complete UTF-8 file contents for write"}]}. Return complete files, never snippets or diffs. Paths are project-relative. Never write outside the project, expose secrets, or modify credentials. Preserve existing CI behavior; when creating a new project or auditing versions, keep the manual workflow trigger and required artifact name intact while updating compatible action versions.
 
-LATEST DEPENDENCIES AND GITHUB ACTIONS POLICY (MANDATORY): Whenever creating a project, or whenever a task touches build configuration, Gradle, Android SDK, CI, or dependencies, audit the ENTIRE project for outdated versions before returning file operations. Use current official release pages, official documentation, and official compatibility matrices to check the newest stable (non-preview, non-alpha, non-beta, non-RC, non-SNAPSHOT) compatible versions. Do not rely on remembered versions or old examples. In particular, ALWAYS check the latest stable major version of actions/setup-java (currently v6, but do not assume v6 will remain latest); also check actions/checkout, actions/upload-artifact, gradle/actions/setup-gradle, android-actions/setup-android, and every other action used by the workflow. Update all of them to their newest stable compatible versions, not merely setup-java. Check the latest stable compatible versions of Gradle, Android Gradle Plugin, Kotlin and its Compose compiler plugin, Compose BOM, AndroidX libraries, Android SDK compile/target levels, and every other direct project dependency. Verify mutual compatibility before selecting versions; do not blindly choose the numerically newest release if it is incompatible with the project's toolchain. Prefer official sources over blogs or third-party version lists. If you cannot access current release information, explicitly say so and do not pretend versions were checked. Avoid deprecated runtimes: prefer GitHub Actions versions that run on the currently supported Node.js runtime and never downgrade an action just to make a workflow pass. If a build warning identifies an old action version, inspect the actual workflow file on the branch being built and update that exact file.
-""".trimIndent()
+VERSION POLICY (strict): When creating a project or touching Gradle, Android, dependencies, or CI, audit every relevant version—not just the file being edited. Check official release pages/docs for the newest stable compatible versions of ALL used GitHub Actions, especially actions/checkout, actions/setup-java, actions/upload-artifact, gradle/actions/setup-gradle and android-actions/setup-android. Also check compatible stable Gradle, AGP, Kotlin/Compose compiler, Android SDK, Compose BOM and AndroidX dependency versions. Choose newest stable compatible releases, not previews and not blindly the highest number. Verify compatibility between versions. If current official release information is unavailable, say so and do not claim versions were checked. Never retain deprecated action/runtime versions when a supported stable release exists.""".trimIndent()
 
     fun toolDefinition(): JSONObject = JSONObject().put("type", "function").put("function", JSONObject()
         .put("name", "apply_file_changes")
@@ -150,5 +146,74 @@ LATEST DEPENDENCIES AND GITHUB ACTIONS POLICY (MANDATORY): Whenever creating a p
             val obj = JSONObject(cleaned.substring(start, end + 1))
             if (obj.optString("operation") != "apply_changes" && !obj.has("files")) null else parseFiles(obj)
         } catch (_: Exception) { null }
+    }
+}
+
+
+object DefaultBuildWorkflow {
+    const val path = ".github/workflows/android-build.yml"
+    val content = """name: Android Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: talk2apk-android-${'$'}{{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '9.8.2'
+          cache-provider: basic
+
+      - name: Build debug APK
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: talk2apk-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
+"""
+}
+
+object ProjectDirectories {
+    fun delete(context: android.content.Context, projectName: String): Boolean {
+        val dir = File(File(context.filesDir, "projects"), ProjectStore.safeProjectName(projectName))
+        return !dir.exists() || dir.deleteRecursively()
+    }
+
+    fun clone(context: android.content.Context, sourceName: String, targetName: String) {
+        val base = File(context.filesDir, "projects")
+        val source = File(base, ProjectStore.safeProjectName(sourceName))
+        val target = File(base, ProjectStore.safeProjectName(targetName))
+        require(source.canonicalFile != target.canonicalFile) { "A project cannot be cloned onto itself" }
+        require(!target.exists() || target.list()?.isEmpty() == true) { "A project with that name already exists" }
+        if (source.exists()) source.copyRecursively(target, overwrite = true) else target.mkdirs()
     }
 }
