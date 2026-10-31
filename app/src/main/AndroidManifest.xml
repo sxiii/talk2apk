@@ -4,8 +4,8 @@
     <application
         android:allowBackup="false"
         android:label="Talk2APK"
-        android:icon="@mipmap/talk2apk_icon"
-        android:roundIcon="@mipmap/talk2apk_icon"
+        android:icon="@drawable/talk2apk_icon"
+        android:roundIcon="@drawable/talk2apk_icon"
         android:supportsRtl="true"
         android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.Material.NoActionBar">

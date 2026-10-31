@@ -410,7 +410,7 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
             TopAppBar(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        androidx.compose.foundation.Image(painterResource(R.mipmap.talk2apk_icon), contentDescription = "Talk2APK logo", modifier = Modifier.size(32.dp))
+                        androidx.compose.foundation.Image(painterResource(R.drawable.talk2apk_icon), contentDescription = "Talk2APK logo", modifier = Modifier.size(32.dp))
                         Box {
                         TextButton(enabled = !busy, onClick = { projectMenu = true }) { Text("${project.name} ▾", maxLines = 1) }
                         DropdownMenu(expanded = projectMenu, onDismissRequest = { projectMenu = false }) {
