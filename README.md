@@ -50,3 +50,8 @@ The workflow uses `actions/checkout@v7`, `actions/setup-java@v6`, `android-actio
 The repository workflow builds the debug APK on every push to any branch and uploads `talk2apk-debug-apk` as a GitHub Actions artifact. The app also retains `workflow_dispatch` for manual runs initiated directly in GitHub.
 
 No full Gradle compilation was available in the packaging environment. Run the repository's GitHub Actions workflow after uploading this source to verify the Android build.
+
+
+### v0.5.2 resource fix
+
+The app icon is now also provided as a text-based Android vector drawable at `app/src/main/res/drawable/talk2apk_icon.xml`. The manifest and Compose toolbar both reference `@drawable/talk2apk_icon` / `R.drawable.talk2apk_icon`. This avoids relying on a PNG being included by a ZIP extraction or Git ignore configuration.
