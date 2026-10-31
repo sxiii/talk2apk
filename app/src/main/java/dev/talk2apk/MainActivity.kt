@@ -96,6 +96,7 @@ private fun Talk2ApkApp(filesDir: File, cacheDir: File, onInstall: (File) -> Uni
 
     LaunchedEffect(projectStore.root.absolutePath) {
         pending = projectStore.loadPending()
+        if (pending.isNotEmpty()) status = "Restored ${pending.size} pending file change(s). Review them in Changes before publishing."
     }
 
     LaunchedEffect(Unit) {
@@ -148,14 +149,14 @@ private fun Talk2ApkApp(filesDir: File, cacheDir: File, onInstall: (File) -> Uni
         topBar = { TopAppBar(title = { Text("Talk2APK") }, actions = { TextButton(onClick = { tab = 2 }) { Text("Settings") } }) },
         bottomBar = { NavigationBar {
             NavigationBarItem(selected = tab == 0, onClick = { tab = 0 }, icon = { Text("✦") }, label = { Text("Chat") })
-            NavigationBarItem(selected = tab == 1, onClick = { tab = 1 }, icon = { Text("↥") }, label = { Text("Build") })
+            NavigationBarItem(selected = tab == 1, onClick = { tab = 1 }, icon = { Text("✓") }, label = { Text("Changes") })
             NavigationBarItem(selected = tab == 2, onClick = { tab = 2 }, icon = { Text("⚙") }, label = { Text("Settings") })
         } }
     ) { padding ->
         when (tab) {
             0 -> Column(Modifier.fillMaxSize().padding(padding).padding(12.dp)) {
                 Text("Project: ${projectStore.root.name}", style = MaterialTheme.typography.titleMedium)
-                Text("AI changes are staged locally. Review the per-file summary, then publish when ready.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Describe what you want to build or change. After sending, Talk2APK opens Changes so you can follow progress and review files.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(8.dp))
                 LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(messages) { msg ->
@@ -168,93 +169,143 @@ private fun Talk2ApkApp(filesDir: File, cacheDir: File, onInstall: (File) -> Uni
                         }
                     }
                 }
-                if (pending.isNotEmpty()) {
-                    Card(Modifier.fillMaxWidth()) {
-                        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("Changes ready for review", style = MaterialTheme.typography.titleMedium)
-                            val summaries = projectStore.summaries(pending)
-                            summaries.forEach { s ->
-                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                    Column(Modifier.weight(1f)) {
-                                        Text(s.path, style = MaterialTheme.typography.bodySmall)
-                                        Text(if (s.action.equals("delete", true)) "File deletion" else "${s.added} lines added · ${s.removed} removed",
-                                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    }
-                                }
-                            }
-                            Text("${pending.size} file operation(s). Local files will be updated after successful publishing.", style = MaterialTheme.typography.bodySmall)
-                            Button(enabled = !busy && githubToken.isNotBlank() && githubOwner.isNotBlank() && githubRepo.isNotBlank(),
-                                onClick = {
-                                    busy = true; status = "Publishing source changes to GitHub…"
-                                    scope.launch {
-                                        try {
-                                            val sha = withContext(Dispatchers.IO) {
-                                                GitHubPublisher(githubToken, githubOwner, githubRepo, githubBranch).publish(pending)
-                                            }
-                                            projectStore.apply(pending)
-                                            projectStore.clearPending()
-                                            status = "Published commit ${sha.take(7)} to $githubOwner/$githubRepo ($githubBranch). You can now build the APK."
-                                            pending = emptyList()
-                                        } catch (e: Exception) { status = "Publish failed: ${e.message}" }
-                                        finally { busy = false }
-                                    }
-                                }, modifier = Modifier.fillMaxWidth()) { Text("Publish to GitHub") }
-                            TextButton(enabled = !busy, onClick = { pending = emptyList(); projectStore.clearPending(); status = "Pending changes discarded. Local project was not modified." }) { Text("Discard changes") }
-                        }
-                    }
-                }
-                if (status.isNotBlank()) Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                 Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(value = input, onValueChange = { input = it }, modifier = Modifier.weight(1f),
                         placeholder = { Text("Describe a feature or change…") }, maxLines = 4, enabled = !busy && pending.isEmpty())
                     Button(enabled = !busy && pending.isEmpty() && input.isNotBlank() && apiKey.isNotBlank(), onClick = {
                         val prompt = input.trim(); input = ""
-                        val updated = messages + ChatMessage("user", prompt); messages = updated; saveHistory(updated); busy = true
+                        val updated = messages + ChatMessage("user", prompt)
+                        messages = updated; saveHistory(updated)
+                        busy = true
+                        status = "Preparing project context…"
+                        tab = 1
                         scope.launch {
                             try {
-                                val reply = withContext(Dispatchers.IO) {
+                                val projectContext = withContext(Dispatchers.IO) {
                                     if (githubToken.isNotBlank() && githubOwner.isNotBlank() && githubRepo.isNotBlank()) {
                                         GitHubPublisher(githubToken, githubOwner, githubRepo, githubBranch).syncProjectIfEmpty(projectStore)
                                     }
-                                    AiClient(apiBase, apiKey, apiModel).send(customSystem, updated, projectStore.contextForAi())
+                                    projectStore.contextForAi()
                                 }
-                                messages = messages + ChatMessage("assistant", reply.text)
-                                saveHistory(messages)
+                                status = "Waiting for AI response… The model is analysing your request and generating code."
+                                val reply = withContext(Dispatchers.IO) {
+                                    AiClient(apiBase, apiKey, apiModel).send(customSystem, updated, projectContext)
+                                }
+                                status = "Processing AI response…"
+                                val nextMessages = messages + ChatMessage("assistant", reply.text)
+                                messages = nextMessages
+                                saveHistory(nextMessages)
                                 if (reply.changes.isNotEmpty()) {
-                                    // Validate every path and operation before presenting a review.
-                                    reply.changes.forEach { change -> projectStore.validatePath(change.path) }
+                                    status = "Validating generated files…"
+                                    reply.changes.forEach { change ->
+                                        projectStore.validatePath(change.path)
+                                        require(change.action.lowercase() in setOf("write", "create", "update", "delete", "remove")) {
+                                            "Unsupported operation for ${change.path}"
+                                        }
+                                    }
+                                    projectStore.savePending(reply.changes)
                                     pending = reply.changes
-                            projectStore.savePending(reply.changes)
+                                    status = "Changes ready for review. Check the file summary below, then publish when ready."
+                                } else {
+                                    status = "AI response received. No source-file changes were returned. You can continue chatting."
                                 }
-                            } catch (e: Exception) { messages = messages + ChatMessage("assistant", "Request failed: ${e.message}"); saveHistory(messages) }
-                            finally { busy = false }
+                            } catch (e: Exception) {
+                                val errorMessages = messages + ChatMessage("assistant", "Request failed: ${e.message}")
+                                messages = errorMessages
+                                saveHistory(errorMessages)
+                                status = "Request failed: ${e.message}"
+                            } finally { busy = false }
                         }
                     }) { Text("Send") }
                 }
                 if (apiKey.isBlank()) Text("Add an AI API key in Settings.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                if (pending.isNotEmpty()) TextButton(onClick = { tab = 1 }) { Text("Review ${pending.size} pending file change(s)") }
             }
             1 -> Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("GitHub Actions build", style = MaterialTheme.typography.titleLarge)
-                Text("Repository: ${githubOwner.ifBlank { "—" }}/${githubRepo.ifBlank { "—" }} · branch $githubBranch")
-                Text(if (pending.isNotEmpty()) "You have unpublished source changes. Publish them from Chat before building." else "Publish source changes from Chat first. Then start the remote Gradle build here.", style = MaterialTheme.typography.bodySmall)
-                Button(enabled = !busy && pending.isEmpty() && githubToken.isNotBlank() && githubOwner.isNotBlank() && githubRepo.isNotBlank(), modifier = Modifier.fillMaxWidth(), onClick = {
-                    busy = true; apkFile = null; status = "Dispatching GitHub Actions workflow…"
-                    scope.launch {
-                        try {
-                            val file = withContext(Dispatchers.IO) {
-                                GitHubBuildClient(githubToken, githubOwner, githubRepo, githubBranch, githubWorkflow, cacheDir)
-                                    .buildAndDownload { text -> scope.launch { status = text } }
-                            }
-                            apkFile = file; status = "Build successful. APK downloaded: ${file.name}"
-                        } catch (e: Exception) { status = "Build failed: ${e.message}" }
-                        finally { busy = false }
+                Text("Changes & publishing", style = MaterialTheme.typography.titleLarge)
+                Text("Repository: ${githubOwner.ifBlank { "—" }}/${githubRepo.ifBlank { "—" }} · branch $githubBranch", style = MaterialTheme.typography.bodyMedium)
+
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                            Text(if (busy) "IN PROGRESS" else if (pending.isNotEmpty()) "REVIEW REQUIRED" else "STATUS",
+                                style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                        }
+                        Text(status, style = MaterialTheme.typography.bodyMedium)
+                        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                     }
-                }) { if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Text("Build APK") }
-                Text(status)
+                }
+
+                Text("Step 1 · Review generated changes", style = MaterialTheme.typography.titleMedium)
+                if (pending.isNotEmpty()) {
+                    val summaries = projectStore.summaries(pending)
+                    Text("${pending.size} operation(s) · ${summaries.count { it.action.lowercase() !in setOf("delete", "remove") }} file(s) written · ${summaries.count { it.action.lowercase() in setOf("delete", "remove") }} deleted",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            summaries.forEach { summary ->
+                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(summary.path, style = MaterialTheme.typography.bodySmall)
+                                        Text(if (summary.action.lowercase() in setOf("delete", "remove")) "File will be deleted" else "${summary.added} lines added · ${summary.removed} removed",
+                                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    Text(if (summary.action.lowercase() in setOf("delete", "remove")) "DELETE" else "EDIT",
+                                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                }
+                            }
+                        }
+                    }
+                    Text("Review summary only: source files remain staged locally until publishing succeeds.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Step 2 · Publish approved changes", style = MaterialTheme.typography.titleMedium)
+                    Button(enabled = !busy && githubToken.isNotBlank() && githubOwner.isNotBlank() && githubRepo.isNotBlank(),
+                        onClick = {
+                            busy = true; status = "Publishing source changes to GitHub…"
+                            scope.launch {
+                                try {
+                                    val sha = withContext(Dispatchers.IO) {
+                                        GitHubPublisher(githubToken, githubOwner, githubRepo, githubBranch).publish(pending)
+                                    }
+                                    projectStore.apply(pending)
+                                    projectStore.clearPending()
+                                    pending = emptyList()
+                                    status = "Published commit ${sha.take(7)} to $githubOwner/$githubRepo ($githubBranch). You can now build the APK."
+                                } catch (e: Exception) { status = "Publish failed: ${e.message}" }
+                                finally { busy = false }
+                            }
+                        }, modifier = Modifier.fillMaxWidth()) { Text("Publish to GitHub") }
+                    TextButton(enabled = !busy, onClick = {
+                        pending = emptyList(); projectStore.clearPending()
+                        status = "Pending changes discarded. Local project was not modified."
+                    }, modifier = Modifier.fillMaxWidth()) { Text("Discard changes") }
+                } else {
+                    Text("No unpublished changes. Send a request in Chat to generate or modify project files.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+
+                Divider()
+                Text("Step 3 · Build APK", style = MaterialTheme.typography.titleMedium)
+                Text("GitHub Actions builds the project remotely. You can start a build after publishing any pending changes.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Button(enabled = !busy && pending.isEmpty() && githubToken.isNotBlank() && githubOwner.isNotBlank() && githubRepo.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth(), onClick = {
+                        busy = true; apkFile = null; status = "Dispatching GitHub Actions workflow…"
+                        scope.launch {
+                            try {
+                                val file = withContext(Dispatchers.IO) {
+                                    GitHubBuildClient(githubToken, githubOwner, githubRepo, githubBranch, githubWorkflow, cacheDir)
+                                        .buildAndDownload { stage -> scope.launch { status = stage } }
+                                }
+                                apkFile = file; status = "Build successful. APK downloaded: ${file.name}"
+                            } catch (e: Exception) { status = "Build failed: ${e.message}" }
+                            finally { busy = false }
+                        }
+                    }) { Text("Build APK") }
                 apkFile?.let { file ->
                     Button(onClick = { onInstall(file) }, modifier = Modifier.fillMaxWidth()) { Text("Install APK") }
-                    TextButton(onClick = onRequestInstallPermission) { Text("Manage install permission") }
+                    TextButton(onClick = onRequestInstallPermission, modifier = Modifier.fillMaxWidth()) { Text("Manage install permission") }
+                }
+                if (githubToken.isBlank() || githubOwner.isBlank() || githubRepo.isBlank()) {
+                    Text("Configure your GitHub owner, repository and token in Settings before publishing or building.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 }
             }
             else -> Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
