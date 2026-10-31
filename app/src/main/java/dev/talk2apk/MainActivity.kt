@@ -14,7 +14,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
-import androidx.compose.ui.res.painterResource
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -410,7 +409,19 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
             TopAppBar(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        androidx.compose.foundation.Image(painterResource(R.drawable.talk2apk_icon), contentDescription = "Talk2APK logo", modifier = Modifier.size(32.dp))
+                        Surface(
+                            modifier = Modifier.size(32.dp),
+                            shape = androidx.compose.foundation.shape.RoundedCornerShape(9.dp),
+                            color = androidx.compose.ui.graphics.Color(0xFF17152B)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = "‹›",
+                                    color = androidx.compose.ui.graphics.Color(0xFF69E6A5),
+                                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                                )
+                            }
+                        }
                         Box {
                         TextButton(enabled = !busy, onClick = { projectMenu = true }) { Text("${project.name} ▾", maxLines = 1) }
                         DropdownMenu(expanded = projectMenu, onDismissRequest = { projectMenu = false }) {
