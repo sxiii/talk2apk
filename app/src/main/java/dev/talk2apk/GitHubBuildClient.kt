@@ -19,11 +19,26 @@ data class BuildSnapshot(
     val htmlUrl: String = "",
     val artifactId: Long? = null,
     val message: String = "",
-    val errorDetails: String = ""
+    val errorDetails: String = "",
+    val runNumber: Int = 0,
+    val createdAt: String = "",
+    val currentStep: String = "",
+    val completedSteps: Int = 0,
+    val totalSteps: Int = 0
 ) {
     val completed: Boolean get() = status == "completed"
     val succeeded: Boolean get() = completed && conclusion == "success" && artifactId != null
 }
+
+data class BuildRunSummary(
+    val runId: Long,
+    val runNumber: Int,
+    val status: String,
+    val conclusion: String,
+    val createdAt: String,
+    val htmlUrl: String,
+    val headSha: String
+)
 
 class GitHubBuildClient(
     private val token: String,
@@ -64,31 +79,39 @@ class GitHubBuildClient(
         return try { JSONObject(c.inputStream.bufferedReader().use { it.readText() }) } finally { c.disconnect() }
     }
 
-    fun dispatchAndFindRun(onStatus: (String) -> Unit): Pair<Long, String> {
+    /** Finds the workflow run automatically created by the push of this commit. */
+    fun findRunForCommit(commitSha: String, onStatus: (String) -> Unit): Pair<Long, String> {
         validate()
-        val encodedWorkflow = enc(workflow)
-        val encodedBranch = enc(branch)
-        val started = Instant.now()
-        onStatus("Starting GitHub Actions…")
-        connection("POST", "/repos/$owner/$repo/actions/workflows/$encodedWorkflow/dispatches",
-            JSONObject().put("ref", branch).toString()).disconnect()
-
-        val deadline = System.currentTimeMillis() + 90_000L
+        require(commitSha.matches(Regex("[0-9a-fA-F]{40}"))) { "Invalid commit SHA" }
+        val deadline = System.currentTimeMillis() + 120_000L
+        onStatus("Code pushed. Waiting for GitHub Actions to start automatically…")
         while (System.currentTimeMillis() < deadline) {
-            val runs = getJson("/repos/$owner/$repo/actions/runs?event=workflow_dispatch&branch=$encodedBranch&per_page=30")
+            val runs = getJson("/repos/$owner/$repo/actions/runs?head_sha=${enc(commitSha)}&per_page=30")
                 .optJSONArray("workflow_runs") ?: JSONArray()
             for (i in 0 until runs.length()) {
                 val r = runs.getJSONObject(i)
-                val pathMatches = r.optString("path").endsWith(workflow) || workflow.matches(Regex("\\d+"))
-                val created = runInstant(r.optString("created_at"))
-                if (pathMatches && !created.isBefore(started.minusSeconds(10))) {
+                val pathMatches = r.optString("path").contains(workflow.substringAfterLast('/')) || workflow.matches(Regex("\\d+"))
+                if (pathMatches && r.optString("head_sha").equals(commitSha, true) && r.optString("event") == "push") {
                     return r.getLong("id") to r.optString("html_url")
                 }
             }
-            onStatus("Workflow dispatched. Waiting for GitHub to create the run…")
-            Thread.sleep(2500)
+            onStatus("GitHub received the push. Waiting for the workflow run to appear…")
+            Thread.sleep(3000)
         }
-        throw IllegalStateException("GitHub accepted the workflow dispatch but no run appeared within 90 seconds. Check workflow_dispatch, branch and Actions permissions.")
+        throw IllegalStateException("No push-triggered Actions run appeared for commit ${commitSha.take(7)}. Check that the workflow has an 'on: push' trigger and Actions are enabled.")
+    }
+
+    fun recentRuns(limit: Int = 10): List<BuildRunSummary> {
+        validate()
+        val runs = getJson("/repos/$owner/$repo/actions/runs?branch=${enc(branch)}&per_page=${limit.coerceIn(1, 30)}")
+            .optJSONArray("workflow_runs") ?: return emptyList()
+        return (0 until runs.length()).mapNotNull { i ->
+            val r = runs.getJSONObject(i)
+            val pathMatches = r.optString("path").contains(workflow.substringAfterLast('/')) || workflow.matches(Regex("\\d+"))
+            if (!pathMatches) return@mapNotNull null
+            BuildRunSummary(r.optLong("id"), r.optInt("run_number"), r.optString("status"),
+                r.optString("conclusion"), r.optString("created_at"), r.optString("html_url"), r.optString("head_sha"))
+        }
     }
 
     fun getSnapshot(runId: Long): BuildSnapshot {
@@ -96,21 +119,47 @@ class GitHubBuildClient(
         val status = run.optString("status", "queued")
         val conclusion = run.optString("conclusion")
         val htmlUrl = run.optString("html_url")
+        val runNumber = run.optInt("run_number")
+        val createdAt = run.optString("created_at")
+        var currentStep = ""
+        var completedSteps = 0
+        var totalSteps = 0
+        if (status == "in_progress") {
+            try {
+                val jobs = getJson("/repos/$owner/$repo/actions/runs/$runId/jobs?per_page=100").optJSONArray("jobs") ?: JSONArray()
+                for (i in 0 until jobs.length()) {
+                    val job = jobs.getJSONObject(i)
+                    val steps = job.optJSONArray("steps") ?: JSONArray()
+                    for (j in 0 until steps.length()) {
+                        val step = steps.getJSONObject(j)
+                        totalSteps++
+                        when (step.optString("status")) {
+                            "completed" -> completedSteps++
+                            "in_progress" -> currentStep = step.optString("name")
+                        }
+                    }
+                }
+            } catch (_: Exception) { }
+        }
         if (status != "completed") {
             val message = when (status) {
                 "queued", "requested", "waiting", "pending" -> "Build queued — waiting for a GitHub runner…"
-                "in_progress" -> "GitHub Actions is building your project…"
+                "in_progress" -> if (currentStep.isNotBlank()) "Building · $currentStep" else "GitHub Actions is building your project…"
                 else -> "GitHub Actions status: $status"
             }
-            return BuildSnapshot(runId, status, conclusion, htmlUrl, message = message)
+            return BuildSnapshot(runId, status, conclusion, htmlUrl, message = message,
+                runNumber = runNumber, createdAt = createdAt, currentStep = currentStep,
+                completedSteps = completedSteps, totalSteps = totalSteps)
         }
         if (conclusion == "success") {
             val artifactId = findArtifact(runId)
             return BuildSnapshot(runId, status, conclusion, htmlUrl, artifactId,
-                if (artifactId != null) "Build successful. APK artifact is ready to download." else "Build succeeded, but the APK artifact has not appeared yet.")
+                if (artifactId != null) "Build successful. APK artifact is ready to download." else "Build succeeded, but the APK artifact has not appeared yet.",
+                runNumber = runNumber, createdAt = createdAt)
         }
         val details = collectFailureDetails(runId)
-        return BuildSnapshot(runId, status, conclusion, htmlUrl, message = "Build finished: ${conclusion.ifBlank { "unknown result" }}.", errorDetails = details)
+        return BuildSnapshot(runId, status, conclusion, htmlUrl, message = "Build finished: ${conclusion.ifBlank { "unknown result" }}.",
+            errorDetails = details, runNumber = runNumber, createdAt = createdAt)
     }
 
     private fun findArtifact(runId: Long): Long? {

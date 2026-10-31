@@ -105,9 +105,11 @@ class ProjectStore(context: Context, projectName: String) {
 }
 
 object AiFileProtocol {
-    val systemPrompt = """You are Talk2APK, an expert Android app coding agent. Use the supplied project tree and file contents; preserve unrelated code and make the smallest complete change. When changing files, call apply_file_changes if available; otherwise return exactly one valid JSON object: {"operation":"apply_changes","files":[{"path":"relative/path","action":"write|delete","content":"complete UTF-8 file contents for write"}]}. Return complete files, never snippets or diffs. Paths are project-relative. Never write outside the project, expose secrets, or modify credentials. Preserve existing CI behavior; when creating a new project or auditing versions, keep the manual workflow trigger and required artifact name intact while updating compatible action versions.
+    val systemPrompt = """You are Talk2APK, an expert Android coding agent. Use the supplied project tree; preserve unrelated files and make complete, minimal changes. Return changes via apply_file_changes tool calls, or exactly one JSON object: {"operation":"apply_changes","files":[{"path":"relative/path","action":"write|delete","content":"complete file contents"}]}. Never return snippets/diffs. Validate project-relative paths; never access secrets or write outside the project.
 
-VERSION POLICY (strict): When creating a project or touching Gradle, Android, dependencies, or CI, audit every relevant version—not just the file being edited. Check official release pages/docs for the newest stable compatible versions of ALL used GitHub Actions, especially actions/checkout, actions/setup-java, actions/upload-artifact, gradle/actions/setup-gradle and android-actions/setup-android. Also check compatible stable Gradle, AGP, Kotlin/Compose compiler, Android SDK, Compose BOM and AndroidX dependency versions. Choose newest stable compatible releases, not previews and not blindly the highest number. Verify compatibility between versions. If current official release information is unavailable, say so and do not claim versions were checked. Never retain deprecated action/runtime versions when a supported stable release exists.""".trimIndent()
+CI RULE: The workflow MUST include `on: push` for the configured branch so a GitHub push starts the build automatically. Preserve existing workflow steps, add the push trigger if missing, and never require/add an in-app manual “Start Build” button. The app may use `[skip ci]` when the project's Auto-build setting is OFF. Preserve artifact name `talk2apk-debug-apk` and upload the APK with actions/upload-artifact.
+
+VERSIONS (mandatory): Whenever creating/editing Android, Gradle or CI files, verify and use the newest stable, mutually compatible releases available at generation time for EVERY used GitHub Action (especially checkout, setup-java, setup-android, setup-gradle, upload-artifact) and all Android/Gradle dependencies (Gradle, AGP, Kotlin/Compose compiler, SDK, Compose BOM, AndroidX). Check official release/docs, not memory; avoid deprecated runtimes and previews. If live verification is unavailable, state that clearly and do not claim versions are current. Never downgrade an action or dependency without a compatibility reason.""".trimIndent()
 
     fun toolDefinition(): JSONObject = JSONObject().put("type", "function").put("function", JSONObject()
         .put("name", "apply_file_changes")
@@ -152,9 +154,21 @@ VERSION POLICY (strict): When creating a project or touching Gradle, Android, de
 
 object DefaultBuildWorkflow {
     const val path = ".github/workflows/android-build.yml"
+
+    fun ensurePushTrigger(existing: String): String {
+        if (Regex("(?m)^\\s*push\\s*:").containsMatchIn(existing)) return existing
+        val onLine = Regex("(?m)^on\\s*:\\s*(?:#.*)?$").find(existing)
+            ?: return content
+        val insertAt = onLine.range.last + 1
+        return existing.substring(0, insertAt) + "\n  push:\n    branches:\n      - \"**\"" + existing.substring(insertAt)
+    }
+
     val content = """name: Android Build
 
 on:
+  push:
+    branches:
+      - "**"
   workflow_dispatch:
 
 permissions:

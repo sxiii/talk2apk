@@ -28,7 +28,10 @@ class AiClient(private val baseUrl: String, private val apiKey: String, private 
         val base = baseUrl.trim().trimEnd('/')
         require(base.startsWith("https://")) { "AI endpoint must use HTTPS" }
         require(apiKey.isNotBlank() && model.isNotBlank()) { "AI API key and model are required" }
-        val msgs = JSONArray().put(JSONObject().put("role", "system").put("content", "$system\n\n$projectContext"))
+        // Always append the current built-in policy after any saved/custom prompt. This upgrades
+        // existing installs too, even if they still have an older system prompt stored locally.
+        val enforcedSystem = "$system\n\nMANDATORY CURRENT TALK2APK POLICY:\n${AiFileProtocol.systemPrompt}\n\n$projectContext"
+        val msgs = JSONArray().put(JSONObject().put("role", "system").put("content", enforcedSystem))
         history.takeLast(24).forEach { m -> msgs.put(JSONObject().put("role", m.role).put("content", m.content)) }
         val endpoint = if (base.endsWith("/v1")) "$base/chat/completions" else "$base/v1/chat/completions"
         val toolBody = JSONObject().put("model", model).put("messages", msgs)

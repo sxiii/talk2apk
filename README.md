@@ -1,68 +1,52 @@
-# Talk2APK v0.4.0
+# Talk2APK v0.5.0
 
-Talk2APK is an Android client for generating Android project source with an AI provider, reviewing file changes, publishing approved changes to GitHub, running GitHub Actions builds, downloading the APK artifact and installing it on the device.
+Talk2APK is an Android client for generating Android project source with an AI model, reviewing changes, publishing them to GitHub, and receiving the APK built by GitHub Actions.
 
-## What's new in v0.4.0
+## v0.5.0 changes
 
-- Multiple independent projects with a project picker.
-- Per-project GitHub owner, repository, branch, workflow and encrypted GitHub token.
-- Global AI defaults, with a per-project toggle to use a separate AI endpoint, model and encrypted key.
-- Create, edit/select, clone and delete projects. Deletion requires confirmation and only removes local Talk2APK data; it does not delete the GitHub repository.
-- Chat history, pending file operations and build status are kept per project.
-- A default GitHub Actions workflow is staged automatically for projects that do not already have the configured workflow; it is included in the normal review/publish step.
-- GitHub Actions build is dispatched separately from artifact download.
-- Build status is polled automatically and restored after reopening the app.
-- On failure, Talk2APK retrieves failed job/step names and attempts to extract compiler/build errors from GitHub Actions logs.
-- The **Download APK** button becomes available only after GitHub reports a successful run and the expected artifact is available. GitHub's artifact download is a ZIP; Talk2APK extracts the APK from it.
-- Compact but strict AI instructions require checking the newest stable compatible versions of all used GitHub Actions (including `actions/setup-java`, `actions/upload-artifact`, `actions/checkout`, `gradle/actions/setup-gradle` and `android-actions/setup-android`) and Android/Gradle dependencies using official sources.
+- Added a Talk2APK launcher/app-bar logo (`app/src/main/res/mipmap-nodpi/talk2apk_icon.png`).
+- Added a **Repeat this prompt** action to every user message in chat. It resubmits that exact prompt using the currently selected AI engine.
+- Added a per-project **Auto-build after publishing** setting, ON by default.
+- Removed the in-app **Start GitHub Actions build** button. Publishing creates a commit; the app then waits for the push-triggered workflow run and monitors it automatically.
+- The default workflow now runs on pushes to all branches and still supports manual dispatch from GitHub's own UI.
+- With Auto-build OFF, the commit message includes `[skip ci]` so GitHub skips the workflow.
+- Added automatic run discovery by commit SHA, live job-step progress, and a collapsible build history.
+- Failed run details stay collapsed until opened. **Send error to AI** sends the failure text as a new prompt and stages a fix for review.
+- APK download is enabled only when GitHub reports success and the expected artifact is available. The artifact ZIP is downloaded and the APK extracted locally.
+- Compact, strict AI system instructions require the newest stable, mutually compatible GitHub Actions and Android dependencies, verified from official sources, and insist on push-triggered builds.
 
-## Project workflow
+## Workflow
 
-1. Create or select a project from the project picker at the top.
-2. Open Settings and configure the project's GitHub repository and token.
-3. Select either the global AI engine or enable a project-specific AI engine.
-4. Describe the app or change in Chat.
-5. Review the generated file list and added/removed line counts in Changes / Build.
-6. Press **Publish to GitHub** to commit approved changes.
-7. Press **Start GitHub Actions build**. The app follows the run until it succeeds or fails.
-8. On success, press **Download APK**, then **Install APK**.
+1. Configure global or project-specific AI settings and the project's GitHub repository/token.
+2. Describe an app or change in Chat. Use **Repeat this prompt** to test another model with the same prompt.
+3. Review the file list and added/removed line counts in Changes / Build.
+4. Press **Publish to GitHub**.
+5. With Auto-build ON, GitHub Actions starts automatically on the push. Talk2APK discovers the run by commit SHA and polls it until success or failure.
+6. On success, download the APK. On failure, expand the error or send it to AI with one tap.
 
 ## GitHub requirements
 
-Create a fine-grained personal access token restricted to the target repository. Recommended permissions:
+Fine-grained token permissions for the target repository:
 
 - Contents: Read and write
-- Actions: Read and write
-- Metadata: Read (normally granted automatically)
+- Actions: Read and write (for listing workflow runs, jobs and artifacts)
+- Metadata: Read (automatically included)
 
-The repository must contain the configured workflow with `workflow_dispatch` enabled. Talk2APK stages a default `.github/workflows/android-build.yml` for a project when it cannot find the configured workflow locally; review and publish that file along with the first source changes. The workflow must upload an artifact named `talk2apk-debug-apk` containing the debug APK. The included workflow uses:
+The workflow uses `actions/checkout@v7`, `actions/setup-java@v6`, `android-actions/setup-android@v4`, `gradle/actions/setup-gradle@v6`, and `actions/upload-artifact@v7`. These are the configured versions in this Talk2APK project; the AI prompt instructs generated projects to verify the newest stable compatible releases rather than blindly copying them.
 
-- `actions/checkout@v7`
-- `actions/setup-java@v6`
-- `android-actions/setup-android@v4`
-- `gradle/actions/setup-gradle@v6`
-- `actions/upload-artifact@v7`
+**Important:** GitHub Actions push-triggered workflows run when a user PAT pushes the commit. Do not replace the user's PAT with `GITHUB_TOKEN` for the publishing operation; GitHub suppresses many recursive workflow triggers for commits made using `GITHUB_TOKEN`.
 
-If GitHub reports a Node.js 20 deprecation, verify that the run is executing the updated workflow file on the branch selected in the build settings. Another workflow file or an older branch may still reference an older action.
+## Security and limitations
 
-## AI provider compatibility
+- API keys and GitHub tokens are encrypted on-device using Android Keystore-backed AES-GCM.
+- Source files are stored in app-private storage. AI file paths are validated against traversal and `.git` writes.
+- Auto-build OFF adds `[skip ci]` to the commit message. It still publishes the source commit, but GitHub Actions skips that commit.
+- The current AI transport supports OpenAI-compatible Chat Completions with function calling and a structured JSON fallback. Native Anthropic Messages, OpenAI Responses/Agents and Gemini protocols are not implemented.
+- Build progress is based on GitHub Actions run and job-step data. GitHub does not provide a precise percentage for every Gradle task; the UI shows indeterminate progress plus the current step when available.
+- The Android app does not run Gradle locally. All builds happen on GitHub-hosted runners.
 
-The current AI client supports OpenAI-compatible Chat Completions endpoints with function calling, with a structured JSON fallback. It does not yet implement native Anthropic Messages, OpenAI Responses/Agents or Gemini-specific protocols. Consumer AI subscriptions do not automatically include API access or API billing.
+## Build
 
-The AI file protocol returns complete UTF-8 text files. Binary assets are not generated by this protocol. File paths are validated to prevent absolute paths and directory traversal. Source files are stored in the app's private storage.
+The repository workflow builds the debug APK on every push to any branch and uploads `talk2apk-debug-apk` as a GitHub Actions artifact. The app also retains `workflow_dispatch` for manual runs initiated directly in GitHub.
 
-## Security notes
-
-- AI API keys and GitHub tokens are encrypted at rest using AES-GCM and a non-exportable Android Keystore key.
-- GitHub credentials are stored separately for each project; global AI credentials are shared only when a project uses the global AI engine.
-- Use fine-grained tokens with repository-scoped permissions.
-- The AI may only propose project file changes; Talk2APK validates paths and requires a separate user publish action.
-- Project deletion removes local source, chat history and saved project credentials after a confirmation. It does not delete remote GitHub repositories.
-
-## Build the Android app
-
-The included GitHub Actions workflow builds the debug APK remotely. Talk2APK itself does not run Gradle on the phone. Update the repository with this source, commit, and run the workflow.
-
-## Testing status
-
-The source package can be inspected and the ZIP archive integrity can be checked, but a full Android Gradle compilation must be verified by running the included GitHub Actions workflow. The development environment used to prepare this source does not have the Android SDK/Gradle toolchain installed.
+No full Gradle compilation was available in the packaging environment. Run the repository's GitHub Actions workflow after uploading this source to verify the Android build.

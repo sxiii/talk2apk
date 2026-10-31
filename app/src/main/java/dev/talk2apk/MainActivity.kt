@@ -14,6 +14,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
+import androidx.compose.ui.res.painterResource
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -83,7 +84,9 @@ private object BuildStateStore {
         val obj = JSONObject().put("runId", state.runId).put("status", state.status)
             .put("conclusion", state.conclusion).put("htmlUrl", state.htmlUrl)
             .put("artifactId", state.artifactId ?: JSONObject.NULL).put("message", state.message)
-            .put("errorDetails", state.errorDetails)
+            .put("errorDetails", state.errorDetails).put("runNumber", state.runNumber)
+            .put("createdAt", state.createdAt).put("currentStep", state.currentStep)
+            .put("completedSteps", state.completedSteps).put("totalSteps", state.totalSteps)
         prefs(context).edit().putString(projectId, obj.toString()).apply()
     }
     fun load(context: Context, projectId: String): BuildSnapshot? {
@@ -92,7 +95,8 @@ private object BuildStateStore {
             val o = JSONObject(raw)
             BuildSnapshot(o.getLong("runId"), o.optString("status", "queued"), o.optString("conclusion"),
                 o.optString("htmlUrl"), o.optLong("artifactId").takeIf { !o.isNull("artifactId") && it > 0 },
-                o.optString("message"), o.optString("errorDetails"))
+                o.optString("message"), o.optString("errorDetails"), o.optInt("runNumber"),
+                o.optString("createdAt"), o.optString("currentStep"), o.optInt("completedSteps"), o.optInt("totalSteps"))
         } catch (_: Exception) { null }
     }
     fun clear(context: Context, projectId: String) { prefs(context).edit().remove(projectId).apply() }
@@ -144,11 +148,14 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
     var input by remember { mutableStateOf("") }
     var messages by remember { mutableStateOf(loadHistory(prefs, project.id)) }
     var pending by remember { mutableStateOf<List<FileChange>>(emptyList()) }
-    var status by remember { mutableStateOf("Select a project, configure its GitHub repository, and start building.") }
+    var status by remember { mutableStateOf("Ready. Describe the Android app or change you want to make.") }
     var busy by remember { mutableStateOf(false) }
     var apkFile by remember { mutableStateOf<File?>(null) }
     var buildState by remember { mutableStateOf(BuildStateStore.load(context, project.id)) }
-    var buildErrorExpanded by remember { mutableStateOf(true) }
+    var buildErrorExpanded by remember { mutableStateOf(false) }
+    var buildHistory by remember { mutableStateOf<List<BuildRunSummary>>(emptyList()) }
+    var expandedHistoryRun by remember { mutableStateOf<Long?>(null) }
+    var historyDetails by remember { mutableStateOf<Map<Long, BuildSnapshot>>(emptyMap()) }
     val scope = rememberCoroutineScope()
     val monitoredBuilds = remember { mutableSetOf<String>() }
     val projectStore = remember(project.id, project.name) { ProjectStore(context, project.name) }
@@ -181,6 +188,7 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
         pending = emptyList()
         apkFile = null
         buildState = BuildStateStore.load(context, next.id)
+        buildErrorExpanded = false; expandedHistoryRun = null; historyDetails = emptyMap()
         status = "Project switched to ${next.name}."
         tab = 0
     }
@@ -245,21 +253,36 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
 
     fun buildClient(p: ProjectProfile, token: String) = GitHubBuildClient(token, p.owner, p.repo, p.branch, p.workflow, cacheDir)
 
+    fun refreshBuildHistory(p: ProjectProfile, token: String) {
+        if (token.isBlank() || p.owner.isBlank() || p.repo.isBlank()) return
+        scope.launch {
+            try {
+                val runs = withContext(Dispatchers.IO) { buildClient(p, token).recentRuns(12) }
+                if (project.id == p.id) buildHistory = runs
+            } catch (_: Exception) { }
+        }
+    }
+
     fun monitorBuild(p: ProjectProfile, token: String, runId: Long, htmlUrl: String) {
-        if (!monitoredBuilds.add(p.id)) return
+        val monitorKey = "${p.id}:$runId"
+        if (!monitoredBuilds.add(monitorKey)) return
         scope.launch {
             try {
                 var transientFailures = 0
                 while (true) {
                 try {
                     val latest = withContext(Dispatchers.IO) { buildClient(p, token).getSnapshot(runId) }
-                    BuildStateStore.save(context, p.id, latest)
-                    if (project.id == p.id) {
+                    val isCurrentRun = BuildStateStore.load(context, p.id)?.runId == runId
+                    if (isCurrentRun) BuildStateStore.save(context, p.id, latest)
+                    if (project.id == p.id && (buildState?.runId == runId || buildState == null)) {
                         buildState = latest
                         status = latest.message
                     }
                     transientFailures = 0
-                    if (latest.completed && (latest.conclusion != "success" || latest.artifactId != null)) break
+                    if (latest.completed && (latest.conclusion != "success" || latest.artifactId != null)) {
+                        refreshBuildHistory(p, token)
+                        break
+                    }
                 } catch (e: Exception) {
                     transientFailures++
                     if (project.id == p.id) status = "Can't refresh GitHub status (${e.message}). Retrying automatically…"
@@ -267,15 +290,15 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                         val failed = BuildSnapshot(runId, "completed", "error", htmlUrl,
                             message = "Stopped monitoring after repeated GitHub API errors.",
                             errorDetails = "${e.message}\nCheck your token, network connection and GitHub Actions run.")
-                        BuildStateStore.save(context, p.id, failed)
-                        if (project.id == p.id) buildState = failed
+                        if (BuildStateStore.load(context, p.id)?.runId == runId) BuildStateStore.save(context, p.id, failed)
+                        if (project.id == p.id && (buildState?.runId == runId || buildState == null)) buildState = failed
                         break
                     }
                 }
                     delay(5000)
                 }
             } finally {
-                monitoredBuilds.remove(p.id)
+                monitoredBuilds.remove(monitorKey)
             }
         }
     }
@@ -283,6 +306,8 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
     LaunchedEffect(project.id, project.name) {
         pending = projectStore.loadPending()
         buildState = BuildStateStore.load(context, project.id)
+        buildHistory = emptyList(); expandedHistoryRun = null; historyDetails = emptyMap(); buildErrorExpanded = false
+        refreshBuildHistory(project, githubToken)
         if (pending.isNotEmpty()) status = "Restored ${pending.size} pending change(s) for ${project.name}."
         val savedBuild = buildState
         if (savedBuild != null && (!savedBuild.completed || (savedBuild.conclusion == "success" && savedBuild.artifactId == null)) && githubToken.isNotBlank()) {
@@ -299,11 +324,94 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
     val effectiveAiModel = if (project.useLocalAi) project.localAiModel else globalAiModel
     val effectiveAiKey = if (project.useLocalAi) localAiKey else globalAiKey
 
+    fun submitPrompt(promptText: String) {
+        val prompt = promptText.trim()
+        if (prompt.isBlank() || busy || pending.isNotEmpty() || effectiveAiKey.isBlank()) return
+        val history = messages + ChatMessage("user", prompt)
+        messages = history
+        saveHistoryFor(project.id, history)
+        busy = true
+        status = "Preparing project context…"
+        buildErrorExpanded = false
+        expandedHistoryRun = null
+        tab = 1
+        val projectSnapshot = project
+        val tokenSnapshot = githubToken
+        val aiBaseSnapshot = effectiveAiBase
+        val aiModelSnapshot = effectiveAiModel
+        val aiKeySnapshot = effectiveAiKey
+        val systemSnapshot = systemPrompt
+        val storeSnapshot = projectStore
+        scope.launch {
+            try {
+                val contextAndWorkflow = withContext(Dispatchers.IO) {
+                    if (tokenSnapshot.isNotBlank() && projectSnapshot.owner.isNotBlank() && projectSnapshot.repo.isNotBlank()) {
+                        GitHubPublisher(tokenSnapshot, projectSnapshot.owner, projectSnapshot.repo, projectSnapshot.branch)
+                            .syncProjectIfEmpty(storeSnapshot)
+                    }
+                    val configuredWorkflow = projectSnapshot.workflow
+                    val workflowPath = if (configuredWorkflow.endsWith(".yml") || configuredWorkflow.endsWith(".yaml")) {
+                        ".github/workflows/${configuredWorkflow.substringAfterLast('/')}"
+                    } else DefaultBuildWorkflow.path
+                    val existingWorkflow = storeSnapshot.read(workflowPath)
+                    val workflowChange = when {
+                        existingWorkflow.isBlank() -> FileChange(workflowPath, "write", DefaultBuildWorkflow.content)
+                        !Regex("(?m)^\\s*push\\s*:").containsMatchIn(existingWorkflow) ->
+                            FileChange(workflowPath, "write", DefaultBuildWorkflow.ensurePushTrigger(existingWorkflow))
+                        else -> null
+                    }
+                    val baseContext = storeSnapshot.contextForAi()
+                    val fullContext = if (workflowChange != null) baseContext + "\n\nAUTOMATIC PUSH-BUILD WORKFLOW (preserve existing steps and ensure the push trigger):\n--- FILE: ${workflowChange.path} ---\n${workflowChange.content}"
+                        else baseContext
+                    fullContext to workflowChange
+                }
+                val projectContext = contextAndWorkflow.first
+                val defaultWorkflowChange = contextAndWorkflow.second
+                status = "Waiting for AI response…"
+                val reply = withContext(Dispatchers.IO) {
+                    AiClient(aiBaseSnapshot, aiKeySnapshot, aiModelSnapshot).send(systemSnapshot, history, projectContext)
+                }
+                messages = messages + ChatMessage("assistant", reply.text)
+                saveHistoryFor(projectSnapshot.id, messages)
+                val stagedChanges = reply.changes.toMutableList()
+                if (defaultWorkflowChange != null) {
+                    val workflowIndex = stagedChanges.indexOfFirst { it.path == defaultWorkflowChange.path }
+                    if (workflowIndex < 0) stagedChanges.add(0, defaultWorkflowChange)
+                    else {
+                        val aiWorkflow = stagedChanges[workflowIndex]
+                        stagedChanges[workflowIndex] = if (aiWorkflow.action.lowercase() in setOf("delete", "remove")) {
+                            defaultWorkflowChange
+                        } else aiWorkflow.copy(content = DefaultBuildWorkflow.ensurePushTrigger(aiWorkflow.content))
+                    }
+                }
+                if (stagedChanges.isNotEmpty()) {
+                    status = "Validating generated files…"
+                    stagedChanges.forEach { change ->
+                        storeSnapshot.validatePath(change.path)
+                        require(change.action.lowercase() in setOf("write", "create", "update", "delete", "remove")) {
+                            "Unsupported operation for ${change.path}"
+                        }
+                    }
+                    storeSnapshot.savePending(stagedChanges)
+                    pending = stagedChanges
+                    status = "${stagedChanges.size} file operation(s) ready for review."
+                } else status = "AI response received. No source-file changes were returned."
+            } catch (e: Exception) {
+                val failed = messages + ChatMessage("assistant", "Request failed: ${e.message}")
+                messages = failed
+                saveHistoryFor(projectSnapshot.id, failed)
+                status = "Request failed: ${e.message}"
+            } finally { busy = false }
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
-                    Box {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        androidx.compose.foundation.Image(painterResource(R.mipmap.talk2apk_icon), contentDescription = "Talk2APK logo", modifier = Modifier.size(32.dp))
+                        Box {
                         TextButton(enabled = !busy, onClick = { projectMenu = true }) { Text("${project.name} ▾", maxLines = 1) }
                         DropdownMenu(expanded = projectMenu, onDismissRequest = { projectMenu = false }) {
                             profiles.forEach { p ->
@@ -314,7 +422,7 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                             DropdownMenuItem(enabled = !busy, text = { Text("Manage projects…") }, onClick = { projectMenu = false; if (!busy) showProjectManager = true })
                         }
                     }
-                },
+                } },
                 actions = { TextButton(onClick = { tab = 2 }) { Text("Settings") } }
             )
         },
@@ -339,7 +447,13 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                             shape = MaterialTheme.shapes.large, modifier = Modifier.fillMaxWidth()) {
                             Column(Modifier.padding(12.dp)) {
                                 Text(if (msg.role == "user") "You" else "AI", style = MaterialTheme.typography.labelMedium)
-                                Spacer(Modifier.height(3.dp)); Text(msg.content)
+                                Spacer(Modifier.height(3.dp))
+                                Text(msg.content)
+                                if (msg.role == "user") {
+                                    TextButton(enabled = !busy && pending.isEmpty(), onClick = { submitPrompt(msg.content) }) {
+                                        Text("↻ Repeat this prompt")
+                                    }
+                                }
                             }
                         }
                     }
@@ -348,65 +462,7 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                     OutlinedTextField(value = input, onValueChange = { input = it }, modifier = Modifier.weight(1f),
                         placeholder = { Text("Describe a feature or change…") }, maxLines = 4, enabled = !busy && pending.isEmpty())
                     Button(enabled = !busy && pending.isEmpty() && input.isNotBlank() && effectiveAiKey.isNotBlank(), onClick = {
-                        val prompt = input.trim(); input = ""
-                        val history = messages + ChatMessage("user", prompt)
-                        messages = history; saveHistoryFor(project.id, history)
-                        busy = true; status = "Preparing project context…"; tab = 1
-                        val projectSnapshot = project
-                        val tokenSnapshot = githubToken
-                        val aiBaseSnapshot = effectiveAiBase
-                        val aiModelSnapshot = effectiveAiModel
-                        val aiKeySnapshot = effectiveAiKey
-                        val systemSnapshot = systemPrompt
-                        scope.launch {
-                            try {
-                                val contextAndWorkflow = withContext(Dispatchers.IO) {
-                                    if (tokenSnapshot.isNotBlank() && projectSnapshot.owner.isNotBlank() && projectSnapshot.repo.isNotBlank()) {
-                                        GitHubPublisher(tokenSnapshot, projectSnapshot.owner, projectSnapshot.repo, projectSnapshot.branch)
-                                            .syncProjectIfEmpty(projectStore)
-                                    }
-                                    val configuredWorkflow = projectSnapshot.workflow
-                                    val workflowPath = if (configuredWorkflow.endsWith(".yml") || configuredWorkflow.endsWith(".yaml")) {
-                                        ".github/workflows/${configuredWorkflow.substringAfterLast('/')}"
-                                    } else DefaultBuildWorkflow.path
-                                    val workflowChange = if (projectStore.read(workflowPath).isBlank()) {
-                                        FileChange(workflowPath, "write", DefaultBuildWorkflow.content)
-                                    } else null
-                                    val baseContext = projectStore.contextForAi()
-                                    val fullContext = if (workflowChange != null) baseContext + "\n\nDEFAULT CI WORKFLOW TEMPLATE (will be included in the staged changes unless you return a replacement for this exact path):\n--- FILE: ${workflowChange.path} ---\n${workflowChange.content}"
-                                        else baseContext
-                                    fullContext to workflowChange
-                                }
-                                val projectContext = contextAndWorkflow.first
-                                val defaultWorkflowChange = contextAndWorkflow.second
-                                status = "Waiting for AI response…"
-                                val reply = withContext(Dispatchers.IO) {
-                                    AiClient(aiBaseSnapshot, aiKeySnapshot, aiModelSnapshot).send(systemSnapshot, history, projectContext)
-                                }
-                                messages = messages + ChatMessage("assistant", reply.text)
-                                saveHistoryFor(projectSnapshot.id, messages)
-                                val stagedChanges = reply.changes.toMutableList()
-                                if (defaultWorkflowChange != null && stagedChanges.none { it.path == defaultWorkflowChange.path }) {
-                                    stagedChanges.add(0, defaultWorkflowChange)
-                                }
-                                if (stagedChanges.isNotEmpty()) {
-                                    status = "Validating generated files…"
-                                    stagedChanges.forEach { change ->
-                                        projectStore.validatePath(change.path)
-                                        require(change.action.lowercase() in setOf("write", "create", "update", "delete", "remove")) {
-                                            "Unsupported operation for ${change.path}"
-                                        }
-                                    }
-                                    projectStore.savePending(stagedChanges)
-                                    pending = stagedChanges
-                                    status = "${stagedChanges.size} file operation(s) ready for review."
-                                } else status = "AI response received. No source-file changes were returned."
-                            } catch (e: Exception) {
-                                val failed = messages + ChatMessage("assistant", "Request failed: ${e.message}")
-                                messages = failed; saveHistoryFor(projectSnapshot.id, failed)
-                                status = "Request failed: ${e.message}"
-                            } finally { busy = false }
-                        }
+                        val prompt = input.trim(); input = ""; submitPrompt(prompt)
                     }) { Text("Send") }
                 }
                 if (effectiveAiKey.isBlank()) Text("Configure the selected AI engine in Settings.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
@@ -422,22 +478,33 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            if (busy || (buildState != null && (!buildState!!.completed || (buildState!!.conclusion == "success" && buildState!!.artifactId == null)))) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                            if (busy || (buildState != null && (!buildState!!.completed || (buildState!!.conclusion == "success" && buildState!!.artifactId == null))))
+                                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.5.dp)
                             Text(when {
-                                busy -> "WORKING"
-                                buildState?.succeeded == true -> "BUILD SUCCESSFUL"
+                                busy -> status.uppercase()
+                                buildState?.succeeded == true -> "BUILD SUCCESSFUL · APK READY"
                                 buildState?.completed == true && buildState?.conclusion == "success" -> "BUILD OK · FINDING ARTIFACT"
-                                buildState?.completed == true -> "BUILD ERROR"
-                                buildState != null -> "BUILD IN PROGRESS"
-                                pending.isNotEmpty() -> "REVIEW REQUIRED"
+                                buildState?.completed == true -> "BUILD FAILED"
+                                buildState != null -> if (buildState!!.status == "queued") "BUILD QUEUED" else "BUILD IN PROGRESS"
+                                pending.isNotEmpty() -> "CHANGES READY FOR REVIEW"
                                 else -> "READY"
-                            }, style = MaterialTheme.typography.labelLarge, color = if (buildState?.completed == true && buildState?.conclusion != "success") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+                            }, style = MaterialTheme.typography.labelLarge,
+                                color = if (buildState?.completed == true && buildState?.conclusion != "success") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
                         }
                         Text(if (buildState != null && buildState!!.runId > 0) buildState!!.message else status, style = MaterialTheme.typography.bodyMedium)
-                        if (busy || (buildState != null && (!buildState!!.completed || (buildState!!.conclusion == "success" && buildState!!.artifactId == null)))) LinearProgressIndicator(Modifier.fillMaxWidth())
-                        if (buildState?.htmlUrl?.isNotBlank() == true) TextButton(onClick = {
-                            try { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(buildState!!.htmlUrl))) } catch (_: Exception) { }
-                        }) { Text("Open GitHub Actions run") }
+                        if (busy || (buildState != null && (!buildState!!.completed || (buildState!!.conclusion == "success" && buildState!!.artifactId == null)))) {
+                            LinearProgressIndicator(Modifier.fillMaxWidth())
+                            Text("Please wait. Talk2APK is monitoring progress automatically.", style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        buildState?.takeIf { it.runId > 0 }?.let { state ->
+                            Text("Run #${state.runNumber} · ${state.createdAt.replace('T', ' ').take(16)}", style = MaterialTheme.typography.labelSmall)
+                            if (state.currentStep.isNotBlank()) Text("Current step: ${state.currentStep} · ${state.completedSteps}/${state.totalSteps} steps completed",
+                                style = MaterialTheme.typography.bodySmall)
+                            if (state.htmlUrl.isNotBlank()) TextButton(onClick = {
+                                try { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(state.htmlUrl))) } catch (_: Exception) { }
+                            }) { Text("Open this run on GitHub") }
+                        }
                     }
                 }
 
@@ -461,75 +528,68 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                             }
                         }
                     }
-                    Text("Files are staged locally. Publishing is a separate action.", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Review the summary, then publish. Auto-build: ${if (project.autoBuild) "ON" else "OFF"}.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Button(enabled = !busy && githubToken.isNotBlank() && project.owner.isNotBlank() && project.repo.isNotBlank(),
                         onClick = {
-                            busy = true; status = "Publishing approved changes to GitHub…"
+                            busy = true; apkFile = null; status = "Publishing approved changes to GitHub…"
                             val p = project; val changes = pending.toList(); val token = githubToken
                             scope.launch {
                                 try {
                                     val sha = withContext(Dispatchers.IO) {
-                                        GitHubPublisher(token, p.owner, p.repo, p.branch).publish(changes)
+                                        val suffix = if (p.autoBuild) "" else " [skip ci]"
+                                        GitHubPublisher(token, p.owner, p.repo, p.branch).publish(changes, "Talk2APK: update Android project$suffix")
                                     }
                                     projectStore.apply(changes); projectStore.clearPending(); pending = emptyList()
-                                    status = "Published commit ${sha.take(7)}. You can now start the GitHub Actions build."
-                                } catch (e: Exception) { status = "Publish failed: ${e.message}" }
-                                finally { busy = false }
+                                    if (p.autoBuild) {
+                                        status = "Published ${sha.take(7)}. Waiting for the automatic GitHub Actions run…"
+                                        val (runId, url) = withContext(Dispatchers.IO) {
+                                            buildClient(p, token).findRunForCommit(sha) { stage ->
+                                                scope.launch { if (project.id == p.id) status = stage }
+                                            }
+                                        }
+                                        val initial = BuildSnapshot(runId, "queued", htmlUrl = url,
+                                            message = "GitHub Actions started automatically after the push.")
+                                        BuildStateStore.save(context, p.id, initial)
+                                        if (project.id == p.id) buildState = initial
+                                        monitorBuild(p, token, runId, url)
+                                    } else {
+                                        status = "Published ${sha.take(7)}. Auto-build is OFF; this commit included [skip ci]."
+                                        refreshBuildHistory(p, token)
+                                    }
+                                } catch (e: Exception) {
+                                    status = "Publish/build tracking failed: ${e.message}"
+                                } finally { busy = false }
                             }
-                        }, modifier = Modifier.fillMaxWidth()) { Text("Publish to GitHub") }
+                        }, modifier = Modifier.fillMaxWidth()) { Text("Publish to GitHub${if (project.autoBuild) " · Auto-build ON" else ""}") }
                     TextButton(enabled = !busy, onClick = {
                         pending = emptyList(); projectStore.clearPending(); status = "Pending changes discarded."
                     }, modifier = Modifier.fillMaxWidth()) { Text("Discard changes") }
                 } else {
-                    Text("No unpublished changes. Generate changes in Chat or build the current GitHub branch.",
+                    Text("No unpublished changes. Describe a change in Chat. Publishing code starts GitHub Actions automatically when Auto-build is ON.",
                         style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-
-                Divider()
-                Text("Step 2 · GitHub Actions build", style = MaterialTheme.typography.titleMedium)
-                Button(enabled = !busy && pending.isEmpty() && githubToken.isNotBlank() && project.owner.isNotBlank() && project.repo.isNotBlank() &&
-                    (buildState == null || buildState!!.completed && !(buildState!!.conclusion == "success" && buildState!!.artifactId == null)),
-                    modifier = Modifier.fillMaxWidth(), onClick = {
-                        busy = true; apkFile = null; buildState = null; BuildStateStore.clear(context, project.id)
-                        status = "Dispatching GitHub Actions workflow…"
-                        val p = project; val token = githubToken
-                        scope.launch {
-                            try {
-                                val (runId, url) = withContext(Dispatchers.IO) {
-                                    buildClient(p, token).dispatchAndFindRun { stage ->
-                                        scope.launch { if (project.id == p.id) status = stage }
-                                    }
-                                }
-                                val initial = BuildSnapshot(runId, "queued", htmlUrl = url, message = "Build queued. Waiting for a GitHub runner…")
-                                BuildStateStore.save(context, p.id, initial)
-                                buildState = initial
-                                status = initial.message
-                                monitorBuild(p, token, runId, url)
-                            } catch (e: Exception) {
-                                status = "Could not start build: ${e.message}"
-                                buildState = BuildSnapshot(-1, "completed", "error", message = status, errorDetails = e.message.orEmpty())
-                            } finally { busy = false }
-                        }
-                    }) { Text("Start GitHub Actions build") }
 
                 buildState?.let { state ->
                     if (state.completed && state.conclusion != "success") {
                         Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
                             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text("Build failed: ${state.conclusion}", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onErrorContainer)
-                                if (state.errorDetails.isNotBlank()) {
-                                    TextButton(onClick = { buildErrorExpanded = !buildErrorExpanded }) {
-                                        Text(if (buildErrorExpanded) "Hide error details" else "Show error details")
-                                    }
-                                    if (buildErrorExpanded) SelectionContainer { Text(state.errorDetails, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer) }
+                                Text("Build failed · Run #${state.runNumber}", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onErrorContainer)
+                                TextButton(onClick = { buildErrorExpanded = !buildErrorExpanded }) {
+                                    Text(if (buildErrorExpanded) "▾ Hide error details" else "▸ Show error details")
                                 }
+                                if (buildErrorExpanded && state.errorDetails.isNotBlank()) SelectionContainer {
+                                    Text(state.errorDetails, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
+                                }
+                                Button(enabled = !busy, onClick = {
+                                    submitPrompt("Please diagnose and fix this GitHub Actions build failure. Inspect the current project files and return complete corrected file changes.\n\nBuild run #${state.runNumber} error:\n${state.errorDetails.ifBlank { state.message }}")
+                                }, modifier = Modifier.fillMaxWidth()) { Text("Send error to AI") }
                             }
                         }
                     }
                     if (state.succeeded) {
-                        Text("Build completed successfully. GitHub's artifact is a ZIP archive containing the APK.",
-                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("Build successful. GitHub's artifact ZIP contains the APK.", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Button(enabled = !busy, onClick = {
                             val p = project; val token = githubToken; val artifactId = state.artifactId!!
                             busy = true; status = "Downloading APK artifact ZIP from GitHub…"
@@ -547,6 +607,76 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                     Text("Downloaded: ${file.name}", style = MaterialTheme.typography.bodySmall)
                     Button(onClick = { onInstall(file) }, modifier = Modifier.fillMaxWidth()) { Text("Install APK") }
                     TextButton(onClick = onRequestInstallPermission, modifier = Modifier.fillMaxWidth()) { Text("Manage install permission") }
+                }
+
+                Divider()
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("Build history", style = MaterialTheme.typography.titleMedium)
+                    TextButton(enabled = !busy, onClick = { refreshBuildHistory(project, githubToken) }) { Text("Refresh") }
+                }
+                if (buildHistory.isEmpty()) Text("No recent workflow runs found.", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                buildHistory.forEach { run ->
+                    val expanded = expandedHistoryRun == run.runId
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text(when {
+                                    run.status != "completed" -> "◌"
+                                    run.conclusion == "success" -> "✓"
+                                    else -> "✕"
+                                }, color = when {
+                                    run.status != "completed" -> MaterialTheme.colorScheme.primary
+                                    run.conclusion == "success" -> MaterialTheme.colorScheme.primary
+                                    else -> MaterialTheme.colorScheme.error
+                                })
+                                Spacer(Modifier.width(8.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text("#${run.runNumber} · ${run.conclusion.ifBlank { run.status }.replaceFirstChar { it.uppercase() }}",
+                                        style = MaterialTheme.typography.bodyMedium)
+                                    Text(run.createdAt.replace('T', ' ').take(16), style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                TextButton(onClick = {
+                                    if (expanded) expandedHistoryRun = null else {
+                                        expandedHistoryRun = run.runId
+                                        if (!historyDetails.containsKey(run.runId)) scope.launch {
+                                            try {
+                                                val detail = withContext(Dispatchers.IO) { buildClient(project, githubToken).getSnapshot(run.runId) }
+                                                historyDetails = historyDetails + (run.runId to detail)
+                                            } catch (e: Exception) { status = "Could not load run details: ${e.message}" }
+                                        }
+                                    }
+                                }) { Text(if (expanded) "Hide" else "Details") }
+                            }
+                            if (expanded) {
+                                val detail = historyDetails[run.runId]
+                                if (detail == null) Row(verticalAlignment = Alignment.CenterVertically) {
+                                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp); Text(" Loading run details…")
+                                } else {
+                                    if (detail.errorDetails.isNotBlank()) SelectionContainer {
+                                        Text(detail.errorDetails, style = MaterialTheme.typography.bodySmall)
+                                    }
+                                    if (detail.completed && detail.conclusion != "success") Button(enabled = !busy, onClick = {
+                                        submitPrompt("Please diagnose and fix this GitHub Actions build failure.\n\nRun #${detail.runNumber}:\n${detail.errorDetails.ifBlank { detail.message }}")
+                                    }, modifier = Modifier.fillMaxWidth()) { Text("Send error to AI") }
+                                    if (detail.succeeded) Button(enabled = !busy, onClick = {
+                                        busy = true
+                                        scope.launch {
+                                            try {
+                                                val file = withContext(Dispatchers.IO) { buildClient(project, githubToken).downloadApk(detail.artifactId!!) }
+                                                apkFile = file; status = "APK downloaded: ${file.name}"
+                                            } catch (e: Exception) { status = "APK download failed: ${e.message}" }
+                                            finally { busy = false }
+                                        }
+                                    }, modifier = Modifier.fillMaxWidth()) { Text("Download APK from run #${detail.runNumber}") }
+                                }
+                                if (run.htmlUrl.isNotBlank()) TextButton(onClick = {
+                                    try { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(run.htmlUrl))) } catch (_: Exception) { }
+                                }) { Text("Open on GitHub") }
+                            }
+                        }
+                    }
                 }
                 if (githubToken.isBlank() || project.owner.isBlank() || project.repo.isBlank()) {
                     Text("Configure this project's GitHub owner, repository and token in Settings.", color = MaterialTheme.colorScheme.error,
@@ -588,6 +718,15 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                 OutlinedTextField(systemPrompt, { systemPrompt = it }, label = { Text("System instructions for this project") },
                     modifier = Modifier.fillMaxWidth(), minLines = 4)
 
+                Divider()
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Auto-build after publishing", style = MaterialTheme.typography.titleMedium)
+                        Text(if (project.autoBuild) "ON · GitHub Actions starts automatically after each push." else "OFF · commits use [skip ci], so Actions will not start.",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(checked = project.autoBuild, onCheckedChange = { project = project.copy(autoBuild = it) })
+                }
                 Divider()
                 Text("GitHub repository", style = MaterialTheme.typography.titleLarge)
                 OutlinedTextField(project.owner, { project = project.copy(owner = it.trim()) }, label = { Text("Owner / organization") },
