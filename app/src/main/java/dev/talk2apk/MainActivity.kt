@@ -9,12 +9,20 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -130,6 +138,9 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
     var showProjectManager by remember { mutableStateOf(false) }
     var showCreateProject by remember { mutableStateOf(false) }
     var newProjectName by remember { mutableStateOf("") }
+    var renameTarget by remember { mutableStateOf<ProjectProfile?>(null) }
+    var renameProjectName by remember { mutableStateOf("") }
+    var renameError by remember { mutableStateOf("") }
     var deleteTarget by remember { mutableStateOf<ProjectProfile?>(null) }
 
     var globalAiBase by remember { mutableStateOf(SecretStore.get("global_ai_base").ifBlank { SecretStore.get("ai_api_base").ifBlank { "https://api.openai.com/v1" } }) }
@@ -156,6 +167,17 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
     var expandedHistoryRun by remember { mutableStateOf<Long?>(null) }
     var historyDetails by remember { mutableStateOf<Map<Long, BuildSnapshot>>(emptyMap()) }
     val scope = rememberCoroutineScope()
+    val waitAnimation = rememberInfiniteTransition(label = "wait-animation")
+    val waitPulse by waitAnimation.animateFloat(
+        initialValue = 0.45f, targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(850), repeatMode = RepeatMode.Reverse),
+        label = "wait-pulse"
+    )
+    val waitRotation by waitAnimation.animateFloat(
+        initialValue = 0f, targetValue = 360f,
+        animationSpec = infiniteRepeatable(tween(1400, easing = LinearEasing)),
+        label = "wait-rotation"
+    )
     val monitoredBuilds = remember { mutableSetOf<String>() }
     val projectStore = remember(project.id, project.name) { ProjectStore(context, project.name) }
 
@@ -201,6 +223,21 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
         profiles = profiles + p
         profileStore.save(profiles, p.id)
         activateProfile(p)
+    }
+
+    fun renameProject(target: ProjectProfile, requestedName: String) {
+        val name = requestedName.trim()
+        require(name.isNotBlank()) { "Enter a project name" }
+        val safe = ProjectStore.safeProjectName(name)
+        require(profiles.none { it.id != target.id && ProjectStore.safeProjectName(it.name).equals(safe, true) }) {
+            "A project with that name already exists"
+        }
+        ProjectDirectories.rename(context, target.name, name)
+        val renamed = target.copy(name = name)
+        profiles = profiles.map { if (it.id == target.id) renamed else it }
+        if (project.id == target.id) project = renamed
+        profileStore.save(profiles, project.id)
+        status = "Project renamed to $name."
     }
 
     fun cloneProject(source: ProjectProfile) {
@@ -424,6 +461,7 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                         }
                         Box {
                         TextButton(enabled = !busy, onClick = { projectMenu = true }) { Text("${project.name} ▾", maxLines = 1) }
+                        TextButton(enabled = !busy, onClick = { renameTarget = project; renameProjectName = project.name; renameError = "" }) { Text("✎") }
                         DropdownMenu(expanded = projectMenu, onDismissRequest = { projectMenu = false }) {
                             profiles.forEach { p ->
                                 DropdownMenuItem(enabled = !busy, text = { Text(if (p.id == project.id) "✓ ${p.name}" else p.name) },
@@ -452,21 +490,48 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                 Text(if (project.useLocalAi) "AI engine: project-specific" else "AI engine: global default",
                     style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(8.dp))
-                LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(messages) { msg ->
-                        Surface(color = if (msg.role == "user") MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
-                            shape = MaterialTheme.shapes.large, modifier = Modifier.fillMaxWidth()) {
-                            Column(Modifier.padding(12.dp)) {
-                                Text(if (msg.role == "user") "You" else "AI", style = MaterialTheme.typography.labelMedium)
-                                Spacer(Modifier.height(3.dp))
-                                Text(msg.content)
-                                if (msg.role == "user") {
-                                    TextButton(enabled = !busy && pending.isEmpty(), onClick = { submitPrompt(msg.content) }) {
-                                        Text("↻ Repeat this prompt")
+                val chatListState = rememberLazyListState()
+                LaunchedEffect(messages.size) {
+                    if (messages.isNotEmpty()) chatListState.animateScrollToItem(messages.lastIndex)
+                }
+                Box(Modifier.weight(1f).fillMaxWidth()) {
+                    LazyColumn(state = chatListState, modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(messages) { msg ->
+                            Surface(color = if (msg.role == "user") MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                                shape = MaterialTheme.shapes.large, modifier = Modifier.fillMaxWidth()) {
+                                Column(Modifier.padding(12.dp)) {
+                                    Text(if (msg.role == "user") "You" else "AI", style = MaterialTheme.typography.labelMedium)
+                                    Spacer(Modifier.height(3.dp))
+                                    Text(msg.content)
+                                    if (msg.role == "user") {
+                                        TextButton(enabled = !busy && pending.isEmpty(), onClick = { submitPrompt(msg.content) }) {
+                                            Text("↻ Repeat this prompt")
+                                        }
                                     }
                                 }
                             }
                         }
+                    }
+                    Column(Modifier.align(Alignment.BottomEnd).padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        SmallFloatingActionButton(onClick = {
+                            if (messages.isNotEmpty()) scope.launch { chatListState.animateScrollToItem(0) }
+                        }, containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer) { Text("↑", style = MaterialTheme.typography.titleLarge) }
+                        SmallFloatingActionButton(onClick = {
+                            if (messages.isNotEmpty()) scope.launch { chatListState.animateScrollToItem(messages.lastIndex) }
+                        }, containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer) { Text("↓", style = MaterialTheme.typography.titleLarge) }
+                    }
+                }
+                if (busy) {
+                    Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        CircularProgressIndicator(Modifier.size(20.dp).graphicsLayer { rotationZ = waitRotation }, strokeWidth = 2.5.dp)
+                        Text("Working…", modifier = Modifier.graphicsLayer { alpha = waitPulse },
+                            color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelLarge)
+                        Text(status, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2)
                     }
                 }
                 Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -490,7 +555,7 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                     Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             if (busy || (buildState != null && (!buildState!!.completed || (buildState!!.conclusion == "success" && buildState!!.artifactId == null))))
-                                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.5.dp)
+                                CircularProgressIndicator(Modifier.size(22.dp).graphicsLayer { rotationZ = waitRotation }, strokeWidth = 2.5.dp)
                             Text(when {
                                 busy -> status.uppercase()
                                 buildState?.succeeded == true -> "BUILD SUCCESSFUL · APK READY"
@@ -499,7 +564,9 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                                 buildState != null -> if (buildState!!.status == "queued") "BUILD QUEUED" else "BUILD IN PROGRESS"
                                 pending.isNotEmpty() -> "CHANGES READY FOR REVIEW"
                                 else -> "READY"
-                            }, style = MaterialTheme.typography.labelLarge,
+                            }, modifier = if (busy || (buildState != null && (!buildState!!.completed || (buildState!!.conclusion == "success" && buildState!!.artifactId == null))))
+                                Modifier.graphicsLayer { alpha = waitPulse } else Modifier,
+                                style = MaterialTheme.typography.labelLarge,
                                 color = if (buildState?.completed == true && buildState?.conclusion != "success") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
                         }
                         Text(if (buildState != null && buildState!!.runId > 0) buildState!!.message else status, style = MaterialTheme.typography.bodyMedium)
@@ -775,7 +842,8 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                                     Text("${p.owner.ifBlank { "No owner" }}/${p.repo.ifBlank { "No repository" }} · ${p.branch}",
                                         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                        TextButton(onClick = { if (p.id != project.id) activateProfile(p); showProjectManager = false; tab = 2 }) { Text("Edit") }
+                                        TextButton(onClick = { if (p.id != project.id) activateProfile(p); showProjectManager = false; tab = 2 }) { Text("Settings") }
+                                        TextButton(onClick = { renameTarget = p; renameProjectName = p.name; renameError = "" }) { Text("Rename") }
                                         TextButton(onClick = { try { cloneProject(p); showProjectManager = false } catch (e: Exception) { status = "Clone failed: ${e.message}" } }) { Text("Clone") }
                                         TextButton(enabled = profiles.size > 1, onClick = { deleteTarget = p }) { Text("Delete") }
                                     }
@@ -799,6 +867,26 @@ private fun Talk2ApkApp(context: Context, cacheDir: File, onInstall: (File) -> U
                 catch (e: Exception) { status = "Could not create project: ${e.message}" }
             }) { Text("Create") } },
             dismissButton = { TextButton(onClick = { showCreateProject = false }) { Text("Cancel") } }
+        )
+    }
+
+    renameTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { renameTarget = null },
+            title = { Text("Rename project") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedTextField(value = renameProjectName, onValueChange = { renameProjectName = it; renameError = "" },
+                        label = { Text("Project name") }, singleLine = true)
+                    if (renameError.isNotBlank()) Text(renameError, color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = { TextButton(onClick = {
+                try { renameProject(target, renameProjectName); renameTarget = null }
+                catch (e: Exception) { renameError = e.message ?: "Could not rename project" }
+            }) { Text("Save name") } },
+            dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("Cancel") } }
         )
     }
 

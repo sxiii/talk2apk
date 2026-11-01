@@ -217,6 +217,15 @@ jobs:
 }
 
 object ProjectDirectories {
+    fun rename(context: android.content.Context, oldName: String, newName: String) {
+        val base = File(context.filesDir, "projects").apply { mkdirs() }
+        val source = File(base, ProjectStore.safeProjectName(oldName))
+        val target = File(base, ProjectStore.safeProjectName(newName))
+        if (source.canonicalFile == target.canonicalFile) return
+        require(!target.exists()) { "A project folder with that name already exists" }
+        if (source.exists()) require(source.renameTo(target)) { "Could not rename the local project folder" }
+    }
+
     fun delete(context: android.content.Context, projectName: String): Boolean {
         val dir = File(File(context.filesDir, "projects"), ProjectStore.safeProjectName(projectName))
         return !dir.exists() || dir.deleteRecursively()
